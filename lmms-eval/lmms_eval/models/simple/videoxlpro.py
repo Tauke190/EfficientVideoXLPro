@@ -1,0 +1,263 @@
+import logging
+import warnings
+from datetime import timedelta
+from typing import List, Optional, Tuple, Union
+
+import torch
+from accelerate import Accelerator, DistributedType, InitProcessGroupKwargs
+from accelerate.state import AcceleratorState
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+warnings.filterwarnings("ignore")
+
+eval_logger = logging.getLogger("lmms-eval")
+
+from lmms_eval import utils
+from lmms_eval.api.instance import Instance
+from lmms_eval.api.model import lmms
+from lmms_eval.api.registry import register_model
+
+from videoxlpro.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
+from videoxlpro.mm_utils import tokenizer_image_token
+from videoxlpro.demo_utils import load_image_processor, process_video
+
+
+@register_model("videoxlpro")
+class VideoXLPro(lmms):
+    def __init__(
+        self,
+        pretrained: str = "lmms-lab/Video-XL-Pro",
+        device: Optional[str] = "cuda:0",
+        batch_size: Optional[Union[int, str]] = 1,
+        attn_implementation: Optional[str] = "flash_attention_2",
+        device_map: Optional[str] = "cuda:0",
+        use_cache: Optional[bool] = True,
+        max_frames_num: Optional[int] = 128,
+        use_sae: Optional[bool] = True,
+        use_rlt: Optional[bool] = False,
+        rlt_threshold: Optional[float] = 0.1,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+
+        accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
+        accelerator = Accelerator(kwargs_handlers=[accelerator_kwargs])
+        self.accelerator = accelerator
+        if accelerator.num_processes > 1:
+            self._device = torch.device(f"cuda:{accelerator.local_process_index}")
+            self.device_map = f"cuda:{accelerator.local_process_index}"
+        elif accelerator.num_processes == 1 and device_map == "auto":
+            self._device = torch.device(device)
+            self.device_map = device_map
+        else:
+            self._device = torch.device(f"cuda:{accelerator.local_process_index}")
+            self.device_map = f"cuda:{accelerator.local_process_index}"
+
+        self.pretrained = pretrained
+        self.max_frames_num = max_frames_num
+        self.use_cache = use_cache
+        self.use_sae = use_sae
+
+        self._model = AutoModelForCausalLM.from_pretrained(
+            pretrained,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16,
+            attn_implementation=attn_implementation,
+            device_map=self.device_map,
+            trust_remote_code=True,
+        )
+        self._tokenizer = AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
+        if self._tokenizer.pad_token_id is None or self._tokenizer.pad_token_id == self._tokenizer.eos_token_id:
+            self._tokenizer.pad_token_id = 0
+        self._image_processor = load_image_processor(self._model, self._tokenizer)
+        self._config = self._model.config
+        self._model.config.use_sae = use_sae
+        self._model.config.use_rlt = use_rlt
+        self._model.config.rlt_threshold = rlt_threshold
+        self.model.eval()
+
+        self.batch_size_per_gpu = int(batch_size)
+        assert self.batch_size_per_gpu == 1, "VideoXLPro does not support batched generation."
+
+        if accelerator.num_processes > 1:
+            assert accelerator.distributed_type in [DistributedType.FSDP, DistributedType.MULTI_GPU, DistributedType.DEEPSPEED]
+            if accelerator.distributed_type == DistributedType.DEEPSPEED:
+                kwargs = {
+                    "train_micro_batch_size_per_gpu": self.batch_size_per_gpu,
+                    "train_batch_size": self.batch_size_per_gpu * accelerator.num_processes,
+                }
+                AcceleratorState().deepspeed_plugin.deepspeed_config_process(must_match=True, **kwargs)
+            if accelerator.distributed_type in [DistributedType.FSDP, DistributedType.DEEPSPEED]:
+                self._model = accelerator.prepare(self.model)
+            else:
+                self._model = accelerator.prepare_model(self.model, evaluation_mode=True)
+            self._rank = self.accelerator.local_process_index
+            self._world_size = self.accelerator.num_processes
+        elif accelerator.num_processes == 1 and device_map == "auto":
+            self._rank = 0
+            self._world_size = 1
+        else:
+            self.model.to(self._device)
+            self._rank = 0
+            self._world_size = 1
+
+    @property
+    def config(self):
+        return self._config
+
+    @property
+    def tokenizer(self):
+        return self._tokenizer
+
+    @property
+    def model(self):
+        if hasattr(self, "accelerator"):
+            return self.accelerator.unwrap_model(self._model)
+        return self._model
+
+    @property
+    def eot_token_id(self):
+        return self.tokenizer.eos_token_id
+
+    @property
+    def max_length(self):
+        return self._config.max_position_embeddings
+
+    @property
+    def batch_size(self):
+        return self.batch_size_per_gpu
+
+    @property
+    def device(self):
+        return self._device
+
+    @property
+    def rank(self):
+        return self._rank
+
+    @property
+    def world_size(self):
+        return self._world_size
+
+    def tok_encode(self, string: str, left_truncate_len=None, add_special_tokens=None) -> List[int]:
+        add_special_tokens = False if add_special_tokens is None else add_special_tokens
+        encoding = self.tokenizer.encode(string, add_special_tokens=add_special_tokens)
+        if left_truncate_len:
+            encoding = encoding[-left_truncate_len:]
+        return encoding
+
+    def tok_decode(self, tokens):
+        try:
+            return self.tokenizer.decode(tokens)
+        except Exception:
+            return self.tokenizer.decode([tokens])
+
+    def flatten(self, input):
+        return [j for i in input for j in i]
+
+    def _build_prompt(self, context: str) -> str:
+        return (
+            f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            f"<|im_start|>user\n{DEFAULT_IMAGE_TOKEN}\n{context}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+    def generate_until(self, requests: List[Instance]) -> List[str]:
+        res = []
+
+        def _collate(x):
+            toks = self.tok_encode(x[0])
+            return -len(toks), x[0]
+
+        re_ords = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
+        chunks = re_ords.get_batched(n=self.batch_size, batch_fn=None)
+        num_iters = len(requests) // self.batch_size if len(requests) % self.batch_size == 0 else len(requests) // self.batch_size + 1
+        pbar = tqdm(total=num_iters, disable=(self.rank != 0), desc="Model Responding")
+
+        for chunk in chunks:
+            batched_contexts, all_gen_kwargs, batched_doc_to_visual, batched_doc_id, batched_task, batched_split = zip(*chunk)
+            task = batched_task[0]
+            split = batched_split[0]
+            batched_visuals = [batched_doc_to_visual[0](self.task_dict[task][split][ids]) for ids in batched_doc_id]
+            assert len(batched_visuals) == 1
+
+            gen_kwargs = dict(all_gen_kwargs[0])
+            gen_kwargs.pop("until", None)
+            gen_kwargs.setdefault("max_new_tokens", 1024)
+            gen_kwargs.setdefault("temperature", 0.01)
+            gen_kwargs.setdefault("top_p", 0.001)
+            gen_kwargs.setdefault("do_sample", True)
+            gen_kwargs.setdefault("num_beams", 1)
+            gen_kwargs.setdefault("use_cache", self.use_cache)
+            gen_kwargs.pop("image_aspect_ratio", None)
+
+            visual = batched_visuals[0]
+            context = batched_contexts[0]
+
+            if not visual or not isinstance(visual[0], str):
+                eval_logger.error("VideoXLPro only supports video inputs (str paths).")
+                res.append("")
+                pbar.update(1)
+                continue
+
+            video_path = visual[0]
+            try:
+                video_tensor, time_stamps = process_video(
+                    video_path, self._tokenizer, self._image_processor, self.device, self.max_frames_num, use_sae=self.use_sae
+                )
+            except Exception as e:
+                eval_logger.error(f"Error loading video {video_path}: {e}")
+                res.append("")
+                pbar.update(1)
+                continue
+
+            prompt = self._build_prompt(context)
+            input_ids = tokenizer_image_token(prompt, self._tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(self.device)
+            attention_mask = torch.ones_like(input_ids)
+
+            try:
+                with torch.inference_mode():
+                    output_ids = self.model.generate(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        images=[video_tensor],
+                        time_embedding=time_stamps,
+                        modalities=["video"],
+                        **gen_kwargs,
+                    )
+                # The model's generate() passes inputs_embeds (not input_ids) to
+                # super().generate(), so HF returns only the newly generated tokens.
+                text_outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+            except Exception as e:
+                raise e
+
+            text_outputs = [r.strip() for r in text_outputs]
+            res.extend(text_outputs)
+            self.cache_hook.add_partial("generate_until", (context, gen_kwargs), text_outputs)
+            pbar.update(1)
+
+        res = re_ords.get_original(res)
+        pbar.close()
+
+        if getattr(self._model.config, "use_rlt", False):
+            gk = getattr(self.model, "_rlt_grand_keep", 0)
+            gd = getattr(self.model, "_rlt_grand_dense", 0)
+            gv = getattr(self.model, "_rlt_grand_videos", 0)
+            if gd > 0:
+                print(
+                    f"\n[RLT] ===== GRAND TOTAL =====\n"
+                    f"[RLT] videos={gv}  tokens kept={gk}/{gd} ({100.0*gk/gd:.1f}%)\n"
+                    f"[RLT] avg LLM visual tokens/video={gk//gv if gv else 0}\n"
+                    f"[RLT] ==========================\n",
+                    flush=True,
+                )
+
+        return res
+
+    def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
+        raise NotImplementedError("loglikelihood is not implemented for VideoXLPro.")
+
+    def generate_until_multi_round(self, requests) -> List[str]:
+        raise NotImplementedError
