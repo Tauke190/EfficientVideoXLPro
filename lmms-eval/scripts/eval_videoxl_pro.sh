@@ -9,18 +9,29 @@ export HF_HOME=/mnt/SSD2/huggingface
 # use_sae=True
 
 export CUDA_VISIBLE_DEVICES=0,2
+# --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,use_rlt=True,rlt_threshold=0.2 \
+
+
+LOG_DIR="./logs/videoxlpro_mlvu"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/eval_$(date +%Y%m%d_%H%M%S).log"
 
 accelerate launch --num_processes=2 --main_process_port 12345 \
     -m lmms_eval \
     --model videoxlpro \
-    --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,use_rlt=True,rlt_threshold=0.2 \
+    --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt=True,apt_threshold=4.0:6.0,apt_num_scales=3 \
     --tasks mlvu_test \
     --batch_size 1 \
-    --limit 200 \
     --log_samples \
     --log_samples_suffix videoxlpro_mlvu \
-    --output_path ./logs/videoxlpro_mlvu \
-    --verbosity=DEBUG
+    --output_path "$LOG_DIR" \
+    --verbosity=DEBUG 2>&1 | tee "$LOG_FILE"
+
+echo ""
+echo "========================================"
+echo "Evaluation complete!"
+echo "Full log saved to: $LOG_FILE"
+echo "========================================"
 
 # Num of sample at 32 frames without SAE - Accuracy MLVU Test
 # 100 - 8.74 
@@ -42,6 +53,11 @@ accelerate launch --num_processes=2 --main_process_port 12345 \
 # 100 - 9.47
 # 200 - 11.93
 # All - 
+
+# Num of sample at 128 frames With APT and SAE enabled 9 ( 44 % of token dropped in encoding) Threshold : 4 - 6
+# 100 - 14.7
+# 200 - 
+# All - 42.7
 
 # 2026-06-25 07:08:07 | INFO     | utils:mlvu_aggregate_results_test:173 - Evaluation on Task Categories: sportsQA: 38.9%
 # 2026-06-25 07:08:07 | INFO     | utils:mlvu_aggregate_results_test:173 - Evaluation on Task Categories: order: 44.0%

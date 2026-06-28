@@ -37,6 +37,11 @@ class VideoXLPro(lmms):
         use_sae: Optional[bool] = True,
         use_rlt: Optional[bool] = False,
         rlt_threshold: Optional[float] = 0.1,
+        use_apt: Optional[bool] = False,
+        apt_threshold: Optional[float] = 4.0,
+        apt_thresholds: Optional[str] = None,
+        apt_num_scales: Optional[int] = 3,
+        apt_input_res: Optional[int] = 392,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -76,6 +81,24 @@ class VideoXLPro(lmms):
         self._model.config.use_sae = use_sae
         self._model.config.use_rlt = use_rlt
         self._model.config.rlt_threshold = rlt_threshold
+        # APT (spatial adaptive patches) -- mutually exclusive with use_rlt.
+        assert not (use_rlt and use_apt), "use_rlt and use_apt are mutually exclusive; enable one at a time"
+        self._model.config.use_apt = use_apt
+        # Thresholds: one per non-base scale (apt_num_scales - 1). Avoid commas --
+        # lmms_eval splits --model_args on commas. Either key works, and each may
+        # be a single value (broadcast to all non-base scales) or a COLON-separated
+        # list, e.g.  apt_threshold=4.0  or  apt_threshold=4.0:5.0.
+        raw = apt_thresholds if apt_thresholds is not None else apt_threshold
+        thresholds = [float(p) for p in str(raw).replace(",", ":").split(":") if p != ""]
+        n_needed = int(apt_num_scales) - 1
+        if len(thresholds) == 1:
+            thresholds = thresholds * n_needed
+        assert len(thresholds) == n_needed, (
+            f"apt needs apt_num_scales-1 = {n_needed} thresholds, got {thresholds}"
+        )
+        self._model.config.apt_thresholds = thresholds
+        self._model.config.apt_num_scales = apt_num_scales
+        self._model.config.apt_input_res = apt_input_res
         self.model.eval()
 
         self.batch_size_per_gpu = int(batch_size)
@@ -251,6 +274,19 @@ class VideoXLPro(lmms):
                     f"[RLT] videos={gv}  tokens kept={gk}/{gd} ({100.0*gk/gd:.1f}%)\n"
                     f"[RLT] avg LLM visual tokens/video={gk//gv if gv else 0}\n"
                     f"[RLT] ==========================\n",
+                    flush=True,
+                )
+
+        if getattr(self._model.config, "use_apt", False):
+            gk = getattr(self.model, "_apt_grand_keep", 0)
+            gd = getattr(self.model, "_apt_grand_dense", 0)
+            gv = getattr(self.model, "_apt_grand_videos", 0)
+            if gd > 0:
+                print(
+                    f"\n[APT] ===== GRAND TOTAL =====\n"
+                    f"[APT] videos={gv}  encoder tokens kept={gk}/{gd} ({100.0*gk/gd:.1f}%)\n"
+                    f"[APT] avg encoder survivors/video={gk//gv if gv else 0}\n"
+                    f"[APT] ==========================\n",
                     flush=True,
                 )
 

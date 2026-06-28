@@ -405,6 +405,70 @@ class LlavaMetaForCausalLM(ABC):
         )
         return tuple(dense_clips)
 
+    def _get_apt_module(self):
+        """Lazily build + cache the SigLIP-APT embedding module.
+
+        Stored via __dict__ (not nn.Module's registry) so it does not re-register
+        the shared vision tower as a duplicate submodule. The APT-specific params
+        (patch_attn, zero_conv) on the returned module are the only trainable
+        additions; the SigLIP backbone stays frozen.
+        """
+        apt = self.__dict__.get("_apt_module", None)
+        if apt is None:
+            from .multimodal_encoder.siglip_apt_embeddings import SiglipAPTEmbeddings
+            vt = self.get_model().get_vision_tower()
+            apt = SiglipAPTEmbeddings(
+                vt.vision_tower,
+                thresholds=getattr(self.config, "apt_thresholds", [4.0, 4.0]),
+                num_scales=getattr(self.config, "apt_num_scales", 3),
+                base_patch_size=getattr(self.config, "apt_base_patch_size", 14),
+                image_size=getattr(self.config, "apt_input_res", 392),
+            ).to(device=vt.device, dtype=vt.dtype)
+            self.__dict__["_apt_module"] = apt
+        return apt
+
+    def encode_clips_apt_dense(self, videos_or_images, split_sizes):
+        """APT-encode each clip cheaply, then scatter survivors back to a dense grid.
+
+        APT re-embeds each frame with a hierarchical (quadtree) patchifier so the
+        SigLIP encoder runs over a reduced, content-adaptive token set. Its masks
+        form a strict spatial partition, so each surviving (possibly coarse) token
+        is broadcast over the base cells it covers to rebuild a dense (T, P, C)
+        grid. Returns a tuple of (T_i, P, C) tensors -- one per clip -- so the
+        standard dense pipeline (interpolate -> add_video -> SAE/DTS -> pool) in
+        encode_multimodals runs unchanged. Survivors are NOT projected here.
+        """
+        from .multimodal_encoder.siglip_apt_embeddings import apt_scatter_back
+        apt = self._get_apt_module()
+        if split_sizes is None:
+            split_sizes = [videos_or_images.shape[0]]
+        per_clip_frames = torch.split(videos_or_images, split_sizes, dim=0)
+
+        dense_clips = []
+        total_keep = total_dense = 0
+        for i, frames in enumerate(per_clip_frames):
+            survivors, output_mask, masks, T, P = apt(frames)
+            n_keep, n_dense = int(output_mask.numel()), int(T * P)
+            total_keep += n_keep
+            total_dense += n_dense
+            rank0_print(
+                f"[APT+DTS] clip={i} frames={T} thresholds={apt.tokenizer.thresholds} "
+                f"encoder survivors={n_keep}/{n_dense} ({100.0*n_keep/n_dense:.1f}% kept) "
+                f"-> scatter-back to dense ({T}, {P}, C) -> DTS"
+            )
+            dense_clips.append(
+                apt_scatter_back(survivors, output_mask, masks, apt.base_patch_size, apt.image_size)
+            )
+        # Keep grand-total counters live so the eval harness summary still works.
+        self._apt_grand_keep = getattr(self, "_apt_grand_keep", 0) + total_keep
+        self._apt_grand_dense = getattr(self, "_apt_grand_dense", 0) + total_dense
+        self._apt_grand_videos = getattr(self, "_apt_grand_videos", 0) + len(per_clip_frames)
+        rank0_print(
+            f"[APT+DTS] TOTAL encoder survivors={total_keep}/{total_dense} "
+            f"({100.0*total_keep/total_dense:.1f}% kept); DTS compresses the dense grid next."
+        )
+        return tuple(dense_clips)
+
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
         #################################################################################
         # if videos_or_images.shape[0] > 360:
@@ -419,7 +483,11 @@ class LlavaMetaForCausalLM(ABC):
         #                        still does its semantic temporal compression (composed).
         #   use_rlt, no use_sae: legacy ragged RLT-only output (no DTS), kept for A/B.
         use_rlt = getattr(self.config, "use_rlt", False)
+        use_apt = getattr(self.config, "use_apt", False)
         use_sae = getattr(self.config, "use_sae", True)
+        # RLT (temporal) and APT (spatial) are separate, mutually-exclusive paths
+        # so each method's gain can be measured independently.
+        assert not (use_rlt and use_apt), "use_rlt and use_apt are mutually exclusive; enable one at a time"
         if use_rlt and not use_sae:
             return self.encode_multimodals_rlt(videos_or_images, video_idx_in_batch, split_sizes)
 
@@ -427,6 +495,11 @@ class LlavaMetaForCausalLM(ABC):
             # Cheap encoder over survivors -> forward-fill to dense (T, P, C) per clip,
             # then fall through to the shared interpolate/add_video/SAE/pool loop below.
             per_videos_or_images_features = self.encode_clips_rlt_dense(videos_or_images, split_sizes)
+        elif use_apt:
+            # APT: content-adaptive hierarchical re-embedding makes the SigLIP
+            # encoder cheap; scatter survivors back to a dense (T, P, C) grid, then
+            # fall through to the shared interpolate/add_video/SAE/pool loop below.
+            per_videos_or_images_features = self.encode_clips_apt_dense(videos_or_images, split_sizes)
         else:
             # Define the maximum batch size (1024 frames)
             max_batch_size = 60
