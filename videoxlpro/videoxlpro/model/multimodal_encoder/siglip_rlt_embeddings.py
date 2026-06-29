@@ -29,7 +29,8 @@ Pipeline (one clip of T frames):
 What it deliberately ADDS on top of SigLIP (because SigLIP is per-image, RLT is
 per-clip):
   * a temporal position table (sinusoidal over frames),
-  * a run-length embedding table (sinusoidal, base=1000),
+  * a LEARNABLE run-length encoding phi_L (paper sec 3.2), trained during
+    fine-tuning; owned by the base model so it reaches the optimizer/checkpoint,
   * cross-frame attention over the packed survivors (RLT-faithful: one block per
     clip via BlockDiagonalMask).
 
@@ -38,7 +39,7 @@ NOTE (downstream): the output is a *ragged* (N, C) token set, not the dense
 SAE -> 2D pool) expects. Wiring this into llava_arch is a separate step.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -97,6 +98,12 @@ class SiglipRLTEmbeddings(nn.Module):
         patch_size: SigLIP patch size (14 for siglip-so400m-patch14-384).
         max_frames: size of the temporal position table.
         use_length_embed: add the run-length embedding (RLT's length encoding).
+        length_embed: optional model-owned learnable run-length encoding phi_L,
+            passed as an nn.Embedding (paper sec 3.2). When given, this wrapper
+            references that module (so it stays in the base model's
+            named_parameters() -> optimizer + checkpoint, and DeepSpeed Zero-3
+            gathers it via the module's forward hook); when None, it creates its own
+            zero-init embedding for standalone / eval use.
     """
 
     def __init__(
@@ -107,6 +114,7 @@ class SiglipRLTEmbeddings(nn.Module):
         max_frames: int = 512,
         use_length_embed: bool = True,
         apply_post_layernorm: bool = False,
+        length_embed: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         self.vision_model = vision_model
@@ -125,18 +133,32 @@ class SiglipRLTEmbeddings(nn.Module):
         # was trained on pre-LN features.
         self.apply_post_layernorm = apply_post_layernorm
 
-        # NEW tables SigLIP doesn't have. Registered as buffers (no grad) so they
-        # move with .to(device/dtype) and are not treated as trainable RLT params.
+        # Temporal position table phi_t (sinusoidal, frozen). SigLIP is per-image and
+        # has no temporal axis; this restores "which frame" each survivor came from.
+        # Non-persistent buffer: recomputed at load, moves with .to(device/dtype).
         self.register_buffer(
             "temporal_pos",
             get_sinusoid_encoding(max_frames, self.embed_dim)[0],          # (max_frames, C)
             persistent=False,
         )
-        self.register_buffer(
-            "length_embed",
-            get_sinusoid_encoding(max_frames, self.embed_dim, base=1000)[0],  # (max_frames, C)
-            persistent=False,
-        )
+
+        # Run-length encoding phi_L (paper "Don't Look Twice", sec 3.2): a LEARNABLE
+        # per-length bias the model trains during fine-tuning to compensate for the
+        # info removed by temporal pruning. (The original frozen sinusoid disabled
+        # exactly the mechanism the paper relies on.) Implemented as an nn.Embedding
+        # so it is consumed via a module forward -- DeepSpeed Zero-3 gathers and
+        # reduce-scatters its weight through the standard forward hook.
+        #   * length_embed passed in -> reference the model-owned module. Stash it in
+        #     __dict__ so this (un-registered) wrapper's .to()/.cuda() can't clone it
+        #     and silently break sharing; gradients still flow to it.
+        #   * length_embed is None   -> own zero-init embedding (standalone/eval). Zero
+        #     init => no-op at the seam initially, so enabling RLT does not shock the
+        #     pretrained features; fine-tuning learns the bias from zero.
+        if length_embed is not None:
+            self.__dict__["length_embed"] = length_embed
+        else:
+            self.length_embed = nn.Embedding(max_frames, self.embed_dim)
+            nn.init.zeros_(self.length_embed.weight)
 
     def _xformers_attention(self, self_attn, x: torch.Tensor, attn_bias) -> torch.Tensor:
         """SigLIP attention via xformers block-diagonal memory_efficient_attention.
@@ -172,9 +194,15 @@ class SiglipRLTEmbeddings(nn.Module):
             x = self.post_layernorm(x)
         return x
 
-    @torch.no_grad()
     def forward(self, pixel_values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
+        NOTE: deliberately NOT wrapped in @torch.no_grad(). The paper propagates
+        gradients to the learnable run-length encoding phi_L during fine-tuning, so
+        the encoder graph must be retained when training. What actually updates is
+        controlled by requires_grad (the SigLIP backbone stays frozen; only phi_L
+        and downstream modules train). At eval, the caller's inference_mode/no_grad
+        keeps this cheap.
+
         Args:
             pixel_values: (T, 3, H, W) frames for ONE clip.
 
@@ -206,14 +234,20 @@ class SiglipRLTEmbeddings(nn.Module):
         mask_flat = token_mask.reshape(-1)                            # (T*P,)
         survivors = emb.reshape(T * P, self.embed_dim)[mask_flat]     # (N, C)
 
-        # 4. Add temporal position (NEW): per-survivor frame index.
+        # 4. Add temporal position phi_t: per-survivor frame index. The buffer is
+        #    placed on-device here (no blanket module .to() at build time), then
+        #    indexed -- index and table must share a device.
         frame_idx = torch.arange(T, device=dev).view(T, 1).expand(T, P).reshape(-1)[mask_flat]
-        survivors = survivors + self.temporal_pos[frame_idx].to(dtype)
+        temporal_pos = self.temporal_pos.to(device=dev, dtype=dtype)
+        survivors = survivors + temporal_pos[frame_idx]
 
-        # 5. Add length embedding (NEW): run-length per survivor (aligned order).
+        # 5. Add learnable run-length encoding phi_L: run-length per survivor
+        #    (aligned order). length_embed is the model-owned nn.Embedding; calling
+        #    it (vs indexing) lets Zero-3 gather its weight, and the cast keeps
+        #    autograd flowing back to it.
         lengths = get_token_lengths_aligned(mask_flat, T, h, w)       # (N,), in [1,T]
         if self.use_length_embed:
-            survivors = survivors + self.length_embed[lengths - 1].to(dtype)
+            survivors = survivors + self.length_embed(lengths - 1).to(device=dev, dtype=dtype)
 
         # 6. Pack and encode with PER-FRAME attention. SigLIP is a 2D image encoder
         #    (weights trained with WITHIN-frame attention), and Video-XL-Pro already

@@ -108,6 +108,14 @@ class ModelArguments:
     use_pos_skipping: Optional[bool] = field(default=False)
     pos_skipping_range: Optional[int] = field(default=4096)
 
+    # Run-Length Tokenization (RLT) at the SigLIP embedding seam. Enables the cheap
+    # survivor-only encoder path and trains the learnable run-length encoding phi_L.
+    use_rlt: bool = field(default=False)
+    use_sae: bool = field(default=True, metadata={"help": "Scatter RLT survivors back to a dense grid and run DTS/SAE (composed). Off => legacy ragged RLT-only."})
+    rlt_threshold: float = field(default=0.3, metadata={"help": "Mean abs pixel-change threshold for dropping temporally-redundant tokens."})
+    rlt_max_frames: int = field(default=512)
+    rlt_patch_size: int = field(default=14)
+
 
 
 @dataclass
@@ -269,6 +277,10 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         keys_to_match = ["mm_projector", "vision_resampler"]
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
+        # RLT's learnable phi_L lives on the base model (not the projector/resampler),
+        # so include it here or an adapter-only save would silently drop it.
+        if getattr(trainer.model.config, "use_rlt", False):
+            keys_to_match.append("rlt_length_embed")
 
         weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
         trainer.model.config.save_pretrained(output_dir)
@@ -1630,6 +1642,14 @@ def train(attn_implementation=None):
         model.config.tokenizer_padding_side = tokenizer.padding_side
         model.config.tokenizer_model_max_length = tokenizer.model_max_length
 
+        # Run-Length Tokenization config -> model.config so the encode_* paths in
+        # llava_arch (gated by getattr(config, "use_rlt", ...)) see it at train time.
+        model.config.use_rlt = model_args.use_rlt
+        model.config.use_sae = model_args.use_sae
+        model.config.rlt_threshold = model_args.rlt_threshold
+        model.config.rlt_max_frames = model_args.rlt_max_frames
+        model.config.rlt_patch_size = model_args.rlt_patch_size
+
         ### Deciding train which part of the model
         if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
             model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
@@ -1683,6 +1703,15 @@ def train(attn_implementation=None):
                 for name, param in model.named_parameters():
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
                         param.requires_grad_(True)
+
+        # RLT: phi_L (run-length encoding) is a learnable parameter trained during
+        # fine-tuning (paper sec 3.2). Create + register it on the base model NOW --
+        # before the optimizer / DeepSpeed engine is built -- and keep it trainable
+        # whenever RLT is enabled, regardless of which other parts are tunable.
+        if getattr(model.config, "use_rlt", False):
+            phi_L = model.get_model().get_rlt_length_embed()
+            phi_L.requires_grad_(True)
+            rank0_print(f"[RLT] learnable run-length encoding phi_L registered (shape={tuple(phi_L.shape)}) and unfrozen.")
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)

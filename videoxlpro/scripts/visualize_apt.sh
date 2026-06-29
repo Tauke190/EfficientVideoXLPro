@@ -4,9 +4,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON="${PYTHON:-/home/av354855/miniconda3/envs/videoxlpro/bin/python}"
 
-VIDEO="${1:-train.mp4}"
+VIDEO="${1:-test_order_20.mp4}"
 THRESHOLDS="${2:-6.5:7.5}"
-DURATION="${3:-4}"
+DURATION="${3:-50}"
 START="${4:-0}"
 FPS="${5:-4}"
 

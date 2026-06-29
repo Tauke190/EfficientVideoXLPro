@@ -51,7 +51,7 @@ class H264Writer:
         if os.path.exists(ff):
             cmd = [ff, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
                    "-s", f"{W}x{H}", "-r", str(fps), "-i", "pipe:0", "-an",
-                   "-c:v", "libopenh264", "-pix_fmt", "yuv420p", path]
+                   "-c:v", "libx264", "-pix_fmt", "yuv420p", path]
             try:
                 self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
             except Exception:

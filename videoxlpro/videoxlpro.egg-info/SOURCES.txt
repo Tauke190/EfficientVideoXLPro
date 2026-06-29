@@ -67,10 +67,12 @@ videoxlpro/model/language_model/llava_mpt.py
 videoxlpro/model/language_model/llava_qwen.py
 videoxlpro/model/language_model/modeling_beacon.py
 videoxlpro/model/language_model/modeling_llama.py
+videoxlpro/model/multimodal_encoder/apt_static_tokens.py
 videoxlpro/model/multimodal_encoder/base_encoder.py
 videoxlpro/model/multimodal_encoder/builder.py
 videoxlpro/model/multimodal_encoder/clip_encoder.py
 videoxlpro/model/multimodal_encoder/rlt_static_tokens.py
+videoxlpro/model/multimodal_encoder/siglip_apt_embeddings.py
 videoxlpro/model/multimodal_encoder/siglip_encoder.py
 videoxlpro/model/multimodal_encoder/siglip_rlt_embeddings.py
 videoxlpro/model/multimodal_projector/builder.py

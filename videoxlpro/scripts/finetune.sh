@@ -3,9 +3,10 @@ export NNODES=1
 export RANK=0
 export ADDR=localhost
 export PORT=12345
-
 # Starting from the pre-trained Video-XL-Pro-3B checkpoint (skips pretrain stage)
-MODEL_PATH="/mnt/SSD2/huggingface/hub/models--MINT-SJTU--Video-XL-Pro-3B/snapshots/d9914fb2249a9de39daac33a3e02a34a991524db"
+
+# /mnt/SSD2/huggingface/hub/models--MINT-SJTU--Video-XL-Pro-3B/snapshots/d9914fb2249a9de39daac33a3e02a34a991524db
+MODEL_PATH="MINT-SJTU--Video-XL-Pro-3B"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
 PROMPT_VERSION=qwen_1_5
@@ -21,7 +22,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --data_path /mnt/SSD2/LLaVA-Finetune/llava_v1_5_mix665k_with_video_chatgpt_pretty.json \
     --image_folder /mnt/SSD2/LLaVA-Finetune \
     --video_folder /mnt/SSD2/LLaVA-Finetune \
-    --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_language_model" \
+    --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter" \
     --mm_vision_tower_lr=2e-6 \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type mlp2x_gelu \
@@ -38,7 +39,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --mm_patch_merge_type unires \
     --bf16 True \
     --run_name $MID_RUN_NAME \
-    --output_dir "/home/av354855/projects/Video-XL/Video-XL-Pro/videoxlpro/outputs/checkpoints/${MID_RUN_NAME}" \
+    --output_dir "/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/${MID_RUN_NAME}" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \

@@ -48,6 +48,12 @@ class LlavaMetaModel:
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
+
+            if getattr(config, "use_rlt", False):
+                # Create the learnable run-length encoding phi_L here so trained-RLT
+                # checkpoints load their weight into it, and (under DeepSpeed Zero-3)
+                # it is partitioned by the surrounding zero.Init context. Idempotent.
+                self.get_rlt_length_embed()
     
         # self.llm_tokenizer = AutoTokenizer.from_pretrained(config._name_or_path)
         self.hidden_size=config.hidden_size
@@ -82,6 +88,25 @@ class LlavaMetaModel:
         if type(vision_tower) is list:
             vision_tower = vision_tower[0]
         return vision_tower
+
+    def get_rlt_length_embed(self):
+        """Learnable run-length encoding phi_L (paper "Don't Look Twice", sec 3.2).
+
+        Owned by the base model (not the RLT wrapper, which is kept out of the module
+        registry) so it appears in named_parameters() -> optimizer + checkpoint, and
+        is consumed via its forward so DeepSpeed Zero-3 gathers it. The RLT wrapper
+        references this same nn.Embedding, so gradients land here. Zero-init: enabling
+        RLT is a no-op at the seam until fine-tuning learns the per-length bias. Sized
+        to the SigLIP encoder width where phi_L is added.
+        """
+        if getattr(self, "rlt_length_embed", None) is None:
+            vt = self.get_vision_tower()
+            dim = getattr(vt, "hidden_size", None) or self.config.mm_hidden_size
+            max_frames = getattr(self.config, "rlt_max_frames", 512)
+            emb = nn.Embedding(max_frames, dim)
+            nn.init.zeros_(emb.weight)
+            self.rlt_length_embed = emb.to(device=vt.device, dtype=vt.dtype)
+        return self.rlt_length_embed
 
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_tower = model_args.vision_tower
@@ -297,7 +322,12 @@ class LlavaMetaForCausalLM(ABC):
                 threshold=getattr(self.config, "rlt_threshold", 0.3),
                 patch_size=getattr(self.config, "rlt_patch_size", 14),
                 max_frames=getattr(self.config, "rlt_max_frames", 512),
-            ).to(device=vt.device, dtype=vt.dtype)
+                length_embed=self.get_model().get_rlt_length_embed(),
+            )
+            # NB: no blanket .to(device/dtype) here. The module aliases the
+            # already-placed vision tower and the model-owned length_embed; a blanket
+            # .to would clone the latter and break sharing with the optimizer /
+            # checkpoint. temporal_pos is placed on-device inside forward().
             self.__dict__["_rlt_module"] = rlt
         return rlt
 
