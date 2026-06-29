@@ -6,7 +6,7 @@ export PORT=12345
 # Starting from the pre-trained Video-XL-Pro-3B checkpoint (skips pretrain stage)
 
 # /mnt/SSD2/huggingface/hub/models--MINT-SJTU--Video-XL-Pro-3B/snapshots/d9914fb2249a9de39daac33a3e02a34a991524db
-MODEL_PATH="MINT-SJTU--Video-XL-Pro-3B"
+MODEL_PATH="MINT-SJTU/Video-XL-Pro-3B"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
 PROMPT_VERSION=qwen_1_5
@@ -19,9 +19,9 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --deepspeed scripts/zero3.json \
     --model_name_or_path ${MODEL_PATH} \
     --version ${PROMPT_VERSION} \
-    --data_path /mnt/SSD2/LLaVA-Finetune/llava_v1_5_mix665k_with_video_chatgpt_pretty.json \
-    --image_folder /mnt/SSD2/LLaVA-Finetune \
-    --video_folder /mnt/SSD2/LLaVA-Finetune \
+    --data_path /home/c3-0/datasets/llava_665K/playground/data/llava_v1_5_mix665k.json \
+    --image_folder /home/c3-0/datasets/llava_665K/playground/data \
+    --video_folder /home/c3-0/datasets/llava_665K/playground/data \
     --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter" \
     --mm_vision_tower_lr=2e-6 \
     --vision_tower ${VISION_MODEL_VERSION} \
@@ -41,8 +41,8 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --run_name $MID_RUN_NAME \
     --output_dir "/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/${MID_RUN_NAME}" \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 1 \
-    --per_device_eval_batch_size 1 \
+    --per_device_train_batch_size 16 \
+    --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 1 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \

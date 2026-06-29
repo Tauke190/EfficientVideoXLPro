@@ -1570,9 +1570,9 @@ def train(attn_implementation=None):
     _model_path_lower = model_args.model_name_or_path.lower()
     _model_type_lower = getattr(model.config, "model_type", "").lower()
     if "mistral" in _model_path_lower or "mixtral" in _model_path_lower or "zephyr" in _model_path_lower:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left", trust_remote_code=True)
     elif "qwen" in _model_path_lower or "qwen" in _model_type_lower:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="right")
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="right", trust_remote_code=True)
     elif (
         "wizardlm-2" in model_args.model_name_or_path.lower()
         or "vicuna" in model_args.model_name_or_path.lower()
@@ -1587,6 +1587,7 @@ def train(attn_implementation=None):
             model_max_length=training_args.model_max_length,
             padding_side="right",
             use_fast=False,
+            trust_remote_code=True,
         )
 
     rank0_print(f"Prompt version: {model_args.version}")
