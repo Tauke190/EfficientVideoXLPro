@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=videoxlpro
-#SBATCH --output=/home/av354855/projects/Video-XL-Pro/slurmlogs/videoxlpro-%j.out
+#SBATCH --output=/home/av354855/EfficientVideoXLPro/slurmlogs/videoxlpro-%j.out
 #SBATCH --gres-flags=enforce-binding
 #SBATCH -p gpu
 #SBATCH -C gmem80
@@ -19,7 +19,9 @@ echo "Free port found: $PORT"
 
 # Load necessary modules
 module load anaconda3
-module load cuda
+# torch is built with cu121, so load a CUDA 12.x toolkit (default 'cuda' resolves to 13.x and
+# breaks DeepSpeedCPUAdam's JIT build). 12.2 is the closest available minor to 12.1.
+module load cuda/12.2
 
 eval "$(conda shell.bash hook)"
 
@@ -36,12 +38,18 @@ echo "Checking PyTorch CUDA version and availability:"
 python -c "import torch; print('torch.version.cuda:', torch.version.cuda); print('torch.cuda.is_available:', torch.cuda.is_available())"
 
 # Change directory
-cd /home/av354855/projects/Video-XL-Pro/videoxlpro
+cd /home/av354855/EfficientVideoXLPro/videoxlpro
 
 export NUM_GPUS=1
 export NNODES=1
 export RANK=0
 export ADDR=localhost
+
+# Bypass DeepSpeed's strict CUDA version-string check; safe because the loaded toolkit (12.x)
+# matches torch's CUDA major version (cu121). Needed for the cpu_adam JIT build under offload.
+export DS_SKIP_CUDA_CHECK=1
+# Reduce CUDA allocator fragmentation (the original OOM had >1GB reserved-but-unallocated).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # /mnt/SSD2/huggingface/hub/models--MINT-SJTU--Video-XL-Pro-3B/snapshots/d9914fb2249a9de39daac33a3e02a34a991524db
 MODEL_PATH="MINT-SJTU/Video-XL-Pro-3B"
@@ -76,7 +84,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --mm_patch_merge_type unires \
     --bf16 True \
     --run_name $MID_RUN_NAME \
-    --output_dir "/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/${MID_RUN_NAME}" \
+    --output_dir "/home/av354855/EfficientVideoXLPro/videoxlpro/outputs/checkpoints/${MID_RUN_NAME}" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
