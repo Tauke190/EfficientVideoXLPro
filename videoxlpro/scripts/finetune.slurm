@@ -65,8 +65,9 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --deepspeed scripts/zero3.json \
     --model_name_or_path ${MODEL_PATH} \
     --version ${PROMPT_VERSION} \
-    --data_path /home/av354855/EfficientVideoXLPro/llava_v1_5_mix665k_filtered.json \
+    --data_path /home/av354855/EfficientVideoXLPro/llava_v1_5_mix665k_img_only.json \
     --image_folder /home/c3-0/datasets/llava_665K/playground/data \
+    --video_folder /home/c3-0/datasets/llava_665K/playground/data \
     --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_language_model" \
     --mm_vision_tower_lr=2e-6 \
     --vision_tower ${VISION_MODEL_VERSION} \

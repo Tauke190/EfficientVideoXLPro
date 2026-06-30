@@ -642,8 +642,13 @@ class LlavaMetaForCausalLM(ABC):
                 embed_token[indices]=image_features[image_idx]
                 
                 video_token_indices.append(indices)
-                
+
                 image_features[image_idx]=embed_token
+            else:
+                # language-only sample (dummy "text" image, time_embedding is None):
+                # keep video_token_indices index-aligned with the batch so the
+                # per-sample lookups below don't run off the end.
+                video_token_indices.append(None)
 
         token_score_features=[]
         for text_ids in range(len(input_ids)):
@@ -676,14 +681,20 @@ class LlavaMetaForCausalLM(ABC):
             t_sum,chan_sum=image_features[text_ids].shape
             image_feature_per=image_features[text_ids]
             
-            if time_embedding[image_idx] is not None:
+            if time_embedding[text_ids] is not None:
                 #print(image_feature_per.shape,end='1\n')
                 image_feature_per=self.get_model().WindowTimeToTokenAttention(image_feature_per)
                 #print(image_feature_per.shape,end='2\n')
+                feats=image_feature_per[video_token_indices[text_ids]]
+            else:
+                # language-only sample: no video tokens to slice, so score the
+                # whole (dummy) feature map. Matches the time_embedding-is-None
+                # branch in the selection loop below.
+                feats=image_feature_per
             #print(image_feature_per.shape)
-            
-            
-            select_mat=torch.matmul(image_feature_per[video_token_indices[text_ids]],outputs_text_select.transpose(0, 1)).mean(dim=-1)
+
+
+            select_mat=torch.matmul(feats,outputs_text_select.transpose(0, 1)).mean(dim=-1)
             
             # if time_embedding[text_ids] is not None:
             #     select_mat=select_mat[video_token_indices[text_ids]]
