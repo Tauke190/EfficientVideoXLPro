@@ -1,9 +1,47 @@
+#!/bin/bash
+#SBATCH --job-name=videoxlpro
+#SBATCH --output=/home/av354855/projects/Video-XL-Pro/slurmlogs/videoxlpro-%j.out
+#SBATCH --gres-flags=enforce-binding
+#SBATCH -p gpu
+#SBATCH -C gmem80
+#SBATCH --gres=gpu:1
+#SBATCH --mem-per-cpu=8G
+#SBATCH --cpus-per-gpu=8
+
+# Starting from the pre-trained Video-XL-Pro-3B checkpoint (skips pretrain stage)
+
+
+PORT=$((RANDOM % 10000 + 20000))
+while ss -tuln | grep -q ":$PORT"; do
+  PORT=$((RANDOM % 10000 + 20000))
+done
+echo "Free port found: $PORT"
+
+# Load necessary modules
+module load anaconda3
+module load cuda
+
+eval "$(conda shell.bash hook)"
+
+# Activate your conda environment
+conda activate videoxlpro
+
+
+echo "Job started at $(date)"
+echo "Running on node: $(hostname)"
+echo "GPU info:"
+nvidia-smi
+
+echo "Checking PyTorch CUDA version and availability:"
+python -c "import torch; print('torch.version.cuda:', torch.version.cuda); print('torch.cuda.is_available:', torch.cuda.is_available())"
+
+# Change directory
+cd /home/av354855/projects/Video-XL-Pro/videoxlpro
+
 export NUM_GPUS=1
 export NNODES=1
 export RANK=0
 export ADDR=localhost
-export PORT=12345
-# Starting from the pre-trained Video-XL-Pro-3B checkpoint (skips pretrain stage)
 
 # /mnt/SSD2/huggingface/hub/models--MINT-SJTU--Video-XL-Pro-3B/snapshots/d9914fb2249a9de39daac33a3e02a34a991524db
 MODEL_PATH="MINT-SJTU/Video-XL-Pro-3B"
@@ -60,4 +98,4 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --report_to wandb \
     --dataloader_drop_last True \
     --attn_implementation flash_attention_2
-
+conda deactivate
