@@ -19,7 +19,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --deepspeed scripts/zero3.json \
     --model_name_or_path ${MODEL_PATH} \
     --version ${PROMPT_VERSION} \
-    --data_path /home/c3-0/datasets/llava_665K/playground/data/llava_v1_5_mix665k.json \
+    --data_path /home/av354855/EfficientVideoXLPro/llava_v1_5_mix665k_filtered.json \
     --image_folder /home/c3-0/datasets/llava_665K/playground/data \
     --video_folder /home/c3-0/datasets/llava_665K/playground/data \
     --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter" \
@@ -41,7 +41,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --run_name $MID_RUN_NAME \
     --output_dir "/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/${MID_RUN_NAME}" \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 16 \
+    --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 1 \
     --evaluation_strategy "no" \

@@ -634,7 +634,7 @@ def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
     targets = torch.tensor(targets, dtype=torch.long)
     
     time_embedding=None
-    if time_stamps[-1]==0.0:
+    if time_stamps is not None and time_stamps[-1]==0.0:
 
         compress_frame = time_stamps
         time_embedding = []
@@ -1343,7 +1343,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             model_args.mm_resampler_type is not None,
         ]
     ):
-        cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path)
+        cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
 
     if model_args.use_pos_skipping is not None and model_args.pos_skipping_range is not None:
         overwrite_config["use_pos_skipping"] = model_args.use_pos_skipping
