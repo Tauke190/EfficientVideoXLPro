@@ -2,10 +2,10 @@ export NUM_GPUS=1
 export NNODES=1
 export RANK=0
 export ADDR=localhost
-export PORT=12345
+export PORT=12344
 
 # Starting from the pre-trained Video-XL-Pro-3B checkpoint (skips pretrain stage)
-MODEL_PATH="/mnt/SSD2/huggingface/hub/models--MINT-SJTU--Video-XL-Pro-3B/snapshots/d9914fb2249a9de39daac33a3e02a34a991524db"
+MODEL_PATH="MINT-SJTU/Video-XL-Pro-3B"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
 PROMPT_VERSION=qwen_1_5
