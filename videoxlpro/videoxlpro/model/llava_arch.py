@@ -54,6 +54,12 @@ class LlavaMetaModel:
                 # checkpoints load their weight into it, and (under DeepSpeed Zero-3)
                 # it is partitioned by the surrounding zero.Init context. Idempotent.
                 self.get_rlt_length_embed()
+
+            if getattr(config, "use_apt_temporal", False):
+                # Same reasoning as RLT's phi_L above, for APT-Temporal's own
+                # run-length embedding (a separate table from RLT's, so the two
+                # modes -- mutually exclusive -- each get their own trained bias).
+                self.get_apt_temporal_reuse_embed()
     
         # self.llm_tokenizer = AutoTokenizer.from_pretrained(config._name_or_path)
         self.hidden_size=config.hidden_size
@@ -107,6 +113,22 @@ class LlavaMetaModel:
             nn.init.zeros_(emb.weight)
             self.rlt_length_embed = emb.to(device=vt.device, dtype=vt.dtype)
         return self.rlt_length_embed
+
+    def get_apt_temporal_reuse_embed(self):
+        """Learnable run-length embedding for APT-Temporal, exact same ownership
+        pattern as get_rlt_length_embed() above (own table, since use_rlt and
+        use_apt_temporal are mutually exclusive modes measured independently).
+        Zero-init: enabling APT-Temporal's collapsing is a no-op bias at the
+        seam until fine-tuning learns the per-run-length bias.
+        """
+        if getattr(self, "apt_temporal_reuse_embed", None) is None:
+            vt = self.get_vision_tower()
+            dim = getattr(vt, "hidden_size", None) or self.config.mm_hidden_size
+            max_frames = getattr(self.config, "apt_temporal_max_frames", 512)
+            emb = nn.Embedding(max_frames, dim)
+            nn.init.zeros_(emb.weight)
+            self.apt_temporal_reuse_embed = emb.to(device=vt.device, dtype=vt.dtype)
+        return self.apt_temporal_reuse_embed
 
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_tower = model_args.vision_tower
@@ -499,6 +521,81 @@ class LlavaMetaForCausalLM(ABC):
         )
         return tuple(dense_clips)
 
+    def _get_apt_temporal_module(self):
+        """Lazily build + cache the APT-Temporal embedding module.
+
+        Reuses the SAME lazily-built/cached SiglipAPTEmbeddings wrapper
+        (_get_apt_module) rather than constructing a second one -- APT-Temporal
+        composes plain APT, it does not duplicate it. Stored via __dict__ (not
+        nn.Module's registry) so it does not re-register the shared vision
+        tower / APT wrapper as a duplicate submodule, same convention as
+        _get_rlt_module / _get_apt_module.
+
+        Deliberately reuses config.rlt_threshold (not a separate
+        apt_temporal_* field) for the dirty-tile check: APT-Temporal's
+        SiglipAPTTemporalEmbeddings operates on the same SigLIP-normalized
+        pixel scale RLT itself does, so it's the literal same knob rather than
+        a second, differently-scaled threshold for the same underlying
+        question ("did this patch change vs. the previous frame?").
+        """
+        tapt = self.__dict__.get("_apt_temporal_module", None)
+        if tapt is None:
+            from .multimodal_encoder.siglip_apt_temporal_embeddings import SiglipAPTTemporalEmbeddings
+            apt = self._get_apt_module()
+            tapt = SiglipAPTTemporalEmbeddings(
+                apt,
+                threshold=getattr(self.config, "rlt_threshold", 0.1),
+                majority_ratio=getattr(self.config, "apt_temporal_majority_ratio", 0.5),
+                max_frames=getattr(self.config, "apt_temporal_max_frames", 512),
+                reuse_len_embed=self.get_model().get_apt_temporal_reuse_embed(),
+            )
+            self.__dict__["_apt_temporal_module"] = tapt
+        return tapt
+
+    def encode_clips_apt_temporal_dense(self, videos_or_images, split_sizes):
+        """APT-Temporal-encode each clip, then scatter back to a dense grid.
+
+        Spatial redundancy is resolved first (each frame gets its own
+        independent entropy-driven partition, exactly like plain APT).
+        Temporal redundancy is resolved second: per base cell, frame t is
+        compared against frame t-1 and classified REDUNDANT (collapse, no
+        fresh embed) / FRESH (re-embed at frame t's own scale) / OVERRIDE
+        (shape mismatch but only a minority of sub-tiles changed -- merge
+        anyway, adopting frame t-1's boundary). See
+        apt_temporal_static_tokens.py for the full precedence rationale.
+        Returns a tuple of (T_i, P, C) tensors -- one per clip -- so the
+        standard dense pipeline (interpolate -> add_video -> SAE/DTS -> pool)
+        in encode_multimodals runs unchanged. Survivors are NOT projected here.
+        """
+        from .multimodal_encoder.siglip_apt_temporal_embeddings import apt_temporal_scatter_back
+        tapt = self._get_apt_temporal_module()
+        if split_sizes is None:
+            split_sizes = [videos_or_images.shape[0]]
+        per_clip_frames = torch.split(videos_or_images, split_sizes, dim=0)
+
+        dense_clips = []
+        total_keep = total_dense = 0
+        for i, frames in enumerate(per_clip_frames):
+            survivors, origin_index, T, P = tapt(frames)
+            n_keep, n_dense = int(survivors.shape[0]), int(T * P)
+            total_keep += n_keep
+            total_dense += n_dense
+            rank0_print(
+                f"[APT-Temporal+DTS] clip={i} frames={T} "
+                f"encoder survivors={n_keep}/{n_dense} ({100.0*n_keep/n_dense:.1f}% kept) "
+                f"-> scatter-back to dense ({T}, {P}, C) -> DTS"
+            )
+            dense_clips.append(apt_temporal_scatter_back(survivors, origin_index, T, P))
+        # Keep grand-total counters live so the eval harness summary still works.
+        self._apt_temporal_grand_keep = getattr(self, "_apt_temporal_grand_keep", 0) + total_keep
+        self._apt_temporal_grand_dense = getattr(self, "_apt_temporal_grand_dense", 0) + total_dense
+        self._apt_temporal_grand_videos = getattr(self, "_apt_temporal_grand_videos", 0) + len(per_clip_frames)
+        rank0_print(
+            f"[APT-Temporal+DTS] TOTAL encoder survivors={total_keep}/{total_dense} "
+            f"({100.0*total_keep/total_dense:.1f}% kept); DTS compresses the dense grid next."
+        )
+        return tuple(dense_clips)
+
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
         #################################################################################
         # if videos_or_images.shape[0] > 360:
@@ -514,10 +611,14 @@ class LlavaMetaForCausalLM(ABC):
         #   use_rlt, no use_sae: legacy ragged RLT-only output (no DTS), kept for A/B.
         use_rlt = getattr(self.config, "use_rlt", False)
         use_apt = getattr(self.config, "use_apt", False)
+        use_apt_temporal = getattr(self.config, "use_apt_temporal", False)
         use_sae = getattr(self.config, "use_sae", True)
-        # RLT (temporal) and APT (spatial) are separate, mutually-exclusive paths
-        # so each method's gain can be measured independently.
-        assert not (use_rlt and use_apt), "use_rlt and use_apt are mutually exclusive; enable one at a time"
+        # RLT (temporal), APT (spatial), and APT-Temporal (spatial-then-temporal
+        # combined) are separate, mutually-exclusive paths so each method's gain
+        # can be measured independently.
+        assert sum([use_rlt, use_apt, use_apt_temporal]) <= 1, (
+            "use_rlt, use_apt, and use_apt_temporal are mutually exclusive; enable one at a time"
+        )
         if use_rlt and not use_sae:
             return self.encode_multimodals_rlt(videos_or_images, video_idx_in_batch, split_sizes)
 
@@ -530,6 +631,12 @@ class LlavaMetaForCausalLM(ABC):
             # encoder cheap; scatter survivors back to a dense (T, P, C) grid, then
             # fall through to the shared interpolate/add_video/SAE/pool loop below.
             per_videos_or_images_features = self.encode_clips_apt_dense(videos_or_images, split_sizes)
+        elif use_apt_temporal:
+            # APT-Temporal: per-frame spatial partition (like APT) THEN temporal
+            # redundancy collapsing across frames (like RLT) on top of it; scatter
+            # back to a dense (T, P, C) grid, then fall through to the shared
+            # interpolate/add_video/SAE/pool loop below.
+            per_videos_or_images_features = self.encode_clips_apt_temporal_dense(videos_or_images, split_sizes)
         else:
             # Define the maximum batch size (1024 frames)
             max_batch_size = 60

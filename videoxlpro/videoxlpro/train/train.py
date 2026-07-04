@@ -116,6 +116,33 @@ class ModelArguments:
     rlt_max_frames: int = field(default=512)
     rlt_patch_size: int = field(default=14)
 
+    # Adaptive Patch Transformer (APT) at the SigLIP embedding seam -- per-frame
+    # spatial quadtree merge. These fields previously had no CLI/dataclass home
+    # at all (APT was only ever toggled at eval time via lmms-eval model_args);
+    # added here as plain config passthroughs so a training script can set them.
+    # NOTE: this does NOT make patch_attn/zero_conv trainable -- they remain
+    # built inside the unregistered _get_apt_module() wrapper in llava_arch.py,
+    # untouched by this file, exactly as before.
+    use_apt: bool = field(default=False)
+    apt_thresholds: Optional[str] = field(default="4.0,4.0", metadata={"help": "Comma-separated entropy thresholds, one per non-base scale (len = apt_num_scales-1)."})
+    apt_num_scales: int = field(default=3)
+    apt_base_patch_size: int = field(default=14)
+    apt_input_res: int = field(default=392)
+
+    # APT-Temporal (TAPT): APT's per-frame spatial partition (spatial redundancy
+    # resolved first) plus RLT-style temporal redundancy collapsing on top (see
+    # apt_temporal_static_tokens.py for the classification precedence). Mutually
+    # exclusive with use_rlt/use_apt (see llava_arch.py:encode_multimodals). Its
+    # run-length embedding IS trained (unlike patch_attn/zero_conv above) -- it's
+    # new functionality core to this feature, unfrozen below. Its dirty-tile
+    # check deliberately reuses rlt_threshold (above) rather than a second,
+    # differently-scaled threshold -- both operate on the same SigLIP-normalized
+    # pixel scale, answering the identical question ("did this patch change vs.
+    # the previous frame?"), so it's one shared knob, not two.
+    use_apt_temporal: bool = field(default=False)
+    apt_temporal_majority_ratio: float = field(default=0.5, metadata={"help": "Fraction of dirty sub-tiles above which a shape-mismatched cell is treated as independent (FRESH) rather than merge-overridden (OVERRIDE)."})
+    apt_temporal_max_frames: int = field(default=512, metadata={"help": "Size of the APT-Temporal run-length embedding table."})
+
 
 
 @dataclass
@@ -281,6 +308,9 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         # so include it here or an adapter-only save would silently drop it.
         if getattr(trainer.model.config, "use_rlt", False):
             keys_to_match.append("rlt_length_embed")
+        # Same reasoning for APT-Temporal's own run-length embedding.
+        if getattr(trainer.model.config, "use_apt_temporal", False):
+            keys_to_match.append("apt_temporal_reuse_embed")
 
         weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
         trainer.model.config.save_pretrained(output_dir)
@@ -1651,6 +1681,28 @@ def train(attn_implementation=None):
         model.config.rlt_max_frames = model_args.rlt_max_frames
         model.config.rlt_patch_size = model_args.rlt_patch_size
 
+        # APT config -> model.config (plain passthrough; patch_attn/zero_conv
+        # trainability is unaffected, see the ModelArguments field comments).
+        model.config.use_apt = model_args.use_apt
+        apt_thresholds = [float(p) for p in str(model_args.apt_thresholds).replace(",", ":").split(":") if p != ""]
+        n_needed = model_args.apt_num_scales - 1
+        if len(apt_thresholds) == 1:
+            apt_thresholds = apt_thresholds * n_needed
+        assert len(apt_thresholds) == n_needed, (
+            f"apt needs apt_num_scales-1 = {n_needed} thresholds, got {apt_thresholds}"
+        )
+        model.config.apt_thresholds = apt_thresholds
+        model.config.apt_num_scales = model_args.apt_num_scales
+        model.config.apt_base_patch_size = model_args.apt_base_patch_size
+        model.config.apt_input_res = model_args.apt_input_res
+
+        # APT-Temporal (TAPT) config -> model.config. Its dirty-tile threshold
+        # is config.rlt_threshold (set above) -- deliberately shared with RLT,
+        # not a separate apt_temporal_* field (see ModelArguments comment).
+        model.config.use_apt_temporal = model_args.use_apt_temporal
+        model.config.apt_temporal_majority_ratio = model_args.apt_temporal_majority_ratio
+        model.config.apt_temporal_max_frames = model_args.apt_temporal_max_frames
+
         ### Deciding train which part of the model
         if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
             model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
@@ -1713,6 +1765,17 @@ def train(attn_implementation=None):
             phi_L = model.get_model().get_rlt_length_embed()
             phi_L.requires_grad_(True)
             rank0_print(f"[RLT] learnable run-length encoding phi_L registered (shape={tuple(phi_L.shape)}) and unfrozen.")
+
+        # APT-Temporal's run-length embedding: same reasoning as phi_L above.
+        # NOTE: patch_attn/zero_conv (APT's own spatial merge) stay untouched --
+        # only this new run-length embedding is unfrozen here.
+        if getattr(model.config, "use_apt_temporal", False):
+            tapt_reuse = model.get_model().get_apt_temporal_reuse_embed()
+            tapt_reuse.requires_grad_(True)
+            rank0_print(
+                f"[APT-Temporal] learnable run-length embedding registered "
+                f"(shape={tuple(tapt_reuse.weight.shape)}) and unfrozen."
+            )
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)

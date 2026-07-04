@@ -80,6 +80,11 @@ _ENC_DIR = os.path.join(
 )
 sys.path.insert(0, _ENC_DIR)
 from apt_static_tokens import compute_patch_entropy_batched, select_patches_by_threshold  # noqa: E402
+from apt_temporal_static_tokens import (  # noqa: E402
+    REDUNDANT, FRESH, OVERRIDE,
+    dense_scale_code_grid, dirty_subtile_mask, shape_match_grid,
+    reference_cell_dirty_stats, classify_cells,
+)
 
 # Per-scale overlay colors in RGB (finest -> coarsest).
 DEFAULT_COLORS = [
@@ -88,6 +93,16 @@ DEFAULT_COLORS = [
     (255, 70, 70),    # 56px  coarse / merged (red)
     (210, 70, 255),   # 112px (purple) -- if num_scales > 3
 ]
+
+# APT-Temporal classification tint colors (RGB), drawn as a translucent fill
+# under the scale-color outlines -- REDUNDANT: dim gray (no compute this
+# frame); FRESH: no tint (normal); OVERRIDE: bright magenta highlight
+# (merge-overridden -- minority of sub-tiles changed, still collapsed).
+TAPT_TINTS = {
+    REDUNDANT: (80, 80, 80),
+    FRESH: None,
+    OVERRIDE: (255, 0, 220),
+}
 
 
 def parse_args():
@@ -106,6 +121,15 @@ def parse_args():
     p.add_argument("--num_scales", type=int, default=3, help="Number of scales (3 -> 14/28/56).")
     p.add_argument("--thresholds", type=float, nargs="+", default=[4.0, 4.0],
                    help="Entropy thresholds, one per non-base scale (len = num_scales-1).")
+    # APT-Temporal (TAPT) overlay
+    p.add_argument("--temporal", action="store_true",
+                   help="Also classify each cell REDUNDANT/FRESH/OVERRIDE vs. the previous "
+                        "frame (see apt_temporal_static_tokens.py) and tint the overlay.")
+    p.add_argument("--pixel_threshold", type=float, default=12.0,
+                   help="0-255-scale mean-abs pixel L1 vs. the previous frame (TAPT dirty signal).")
+    p.add_argument("--majority_ratio", type=float, default=0.5,
+                   help="Fraction of dirty sub-tiles above which a shape-mismatched cell is "
+                        "independent (FRESH) rather than merge-overridden (OVERRIDE).")
     # rendering
     p.add_argument("--canvas", type=int, default=784, help="Output frame size (square); patches scaled to match.")
     p.add_argument("--thickness", type=int, default=1, help="Patch outline thickness.")
@@ -150,11 +174,69 @@ def compute_partition(frame_rgb, image_size, patch_size, num_scales, thresholds,
     return sq, {ps: masks[ps][0].detach().cpu().numpy() for ps in masks}
 
 
-def draw_overlay(sq_rgb, masks, patch_sizes, colors, thickness, canvas, ts, thresholds):
-    """Draw color-coded adaptive patches + stats onto an upscaled canvas (RGB)."""
+def compute_temporal_classification(sq_frames, patch_sizes, base_patch_size, num_scales,
+                                     thresholds, pixel_threshold, majority_ratio, device):
+    """Classify every base cell of every sampled frame as REDUNDANT/FRESH/OVERRIDE
+    vs. the previous frame (see apt_temporal_static_tokens.py). Fully vectorized
+    across the whole sampled sequence -- same primitives the encoder uses, so
+    what's rendered is what SiglipAPTTemporalEmbeddings would actually do.
+
+    sq_frames: list of (image_size, image_size, 3) uint8 RGB arrays (already
+        resized to the APT processing grid by the per-frame compute_partition
+        calls in main()).
+    Returns (T, G, G) numpy long array.
+    """
+    stacked = np.stack(sq_frames, axis=0)                                 # (T,H,W,3) uint8
+    t = torch.from_numpy(stacked).to(device).permute(0, 3, 1, 2).float()  # (T,3,H,W) in [0,255]
+    maps = compute_patch_entropy_batched(t, patch_size=base_patch_size, num_scales=num_scales)
+    masks = select_patches_by_threshold(maps, thresholds=thresholds)
+
+    scale_grid = dense_scale_code_grid(masks, patch_sizes, base_patch_size)
+    dirty = dirty_subtile_mask(t, pixel_threshold, base_patch_size)
+    shape_match = shape_match_grid(scale_grid, masks, patch_sizes, base_patch_size)
+    all_quiet, majority_dirty = reference_cell_dirty_stats(
+        dirty, scale_grid, patch_sizes, base_patch_size, majority_ratio
+    )
+    cls = classify_cells(shape_match, all_quiet, majority_dirty)
+    return cls.detach().cpu().numpy()
+
+
+def draw_temporal_tint(disp, cls_frame, base_patch_size, proc, canvas, alpha=0.35):
+    """Alpha-blend a translucent per-base-cell tint onto `disp` according to
+    this frame's REDUNDANT/FRESH/OVERRIDE classification. Drawn BEFORE the
+    scale-color outlines in draw_overlay so those remain crisp on top."""
+    scale = canvas / proc
+    side = int(round(base_patch_size * scale))
+    G = cls_frame.shape[0]
+    overlay = disp.copy()
+    any_tint = False
+    for i in range(G):
+        for j in range(G):
+            color = TAPT_TINTS.get(int(cls_frame[i, j]))
+            if color is None:
+                continue
+            any_tint = True
+            x1, y1 = int(round(j * side)), int(round(i * side))
+            cv2.rectangle(overlay, (x1, y1), (x1 + side - 1, y1 + side - 1), color, -1)
+    if any_tint:
+        cv2.addWeighted(overlay, alpha, disp, 1 - alpha, 0, dst=disp)
+    return disp
+
+
+def draw_overlay(sq_rgb, masks, patch_sizes, colors, thickness, canvas, ts, thresholds,
+                  cls_frame=None, base_patch_size=None):
+    """Draw color-coded adaptive patches + stats onto an upscaled canvas (RGB).
+
+    cls_frame (optional): (G,G) REDUNDANT/FRESH/OVERRIDE classification for
+    this frame vs. the previous one (see compute_temporal_classification) --
+    tinted underneath the scale-color outlines when provided.
+    """
     proc = sq_rgb.shape[0]
     scale = canvas / proc
     disp = cv2.resize(sq_rgb, (canvas, canvas), interpolation=cv2.INTER_LINEAR)
+
+    if cls_frame is not None:
+        disp = draw_temporal_tint(disp, cls_frame, base_patch_size, proc, canvas)
 
     counts = {}
     dense = (proc // patch_sizes[0]) ** 2
@@ -175,6 +257,11 @@ def draw_overlay(sq_rgb, masks, patch_sizes, colors, thickness, canvas, ts, thre
         f"t={ts:.2f}s   tokens={survivors}/{dense} ({100*retained:.1f}% kept)",
         f"thr={thresholds}",
     ]
+    if cls_frame is not None:
+        n_redundant = int((cls_frame == REDUNDANT).sum())
+        n_fresh = int((cls_frame == FRESH).sum())
+        n_override = int((cls_frame == OVERRIDE).sum())
+        lines.append(f"TAPT: redundant={n_redundant} fresh={n_fresh} override={n_override}")
     y = 22
     for ln in lines:
         cv2.putText(disp, ln, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
@@ -186,6 +273,15 @@ def draw_overlay(sq_rgb, masks, patch_sizes, colors, thickness, canvas, ts, thre
         txt = f"{ps}px x{counts[ps]}"
         cv2.putText(disp, txt, (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(disp, txt, (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        y += 22
+    if cls_frame is not None:
+        cv2.rectangle(disp, (8, y - 12), (24, y + 2), TAPT_TINTS[OVERRIDE], -1)
+        cv2.putText(disp, "OVERRIDE (merged anyway)", (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(disp, "OVERRIDE (merged anyway)", (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        y += 22
+        cv2.rectangle(disp, (8, y - 12), (24, y + 2), TAPT_TINTS[REDUNDANT], -1)
+        cv2.putText(disp, "REDUNDANT (no compute)", (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(disp, "REDUNDANT (no compute)", (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         y += 22
     return disp, survivors, dense
 
@@ -211,13 +307,38 @@ def main():
     out_fps = args.out_fps or args.fps
     writer = H264Writer(args.out, out_fps, (args.canvas, args.canvas))
 
-    grand_keep = grand_dense = 0
-    for k, (frame, ts) in enumerate(zip(frames, timestamps)):
+    # Pass 1: resize + per-frame entropy partition for every sampled frame
+    # (independent per frame -- exactly what the encoder's per-frame APT does).
+    sq_frames, per_frame_masks = [], []
+    for frame in frames:
         sq, masks = compute_partition(
             frame, args.image_size, args.patch_size, args.num_scales, args.thresholds, args.device
         )
+        sq_frames.append(sq)
+        per_frame_masks.append(masks)
+
+    cls = None
+    if args.temporal:
+        # Pass 2 (temporal, needs the whole sequence at once): classify every
+        # base cell of every frame REDUNDANT/FRESH/OVERRIDE vs. the previous one.
+        cls = compute_temporal_classification(
+            sq_frames, patch_sizes, args.patch_size, args.num_scales, args.thresholds,
+            args.pixel_threshold, args.majority_ratio, args.device,
+        )
+        n_redundant = int((cls == REDUNDANT).sum())
+        n_fresh = int((cls == FRESH).sum())
+        n_override = int((cls == OVERRIDE).sum())
+        n_total = cls.size
+        print(f"[TAPT] classification over {len(frames)} frames: "
+              f"redundant={n_redundant}/{n_total} ({100*n_redundant/n_total:.1f}%, no compute needed) "
+              f"fresh={n_fresh} override={n_override}")
+
+    grand_keep = grand_dense = 0
+    for k, (sq, masks, ts) in enumerate(zip(sq_frames, per_frame_masks, timestamps)):
+        cls_frame = cls[k] if cls is not None else None
         disp, keep, dense = draw_overlay(
-            sq, masks, patch_sizes, colors, args.thickness, args.canvas, ts, args.thresholds
+            sq, masks, patch_sizes, colors, args.thickness, args.canvas, ts, args.thresholds,
+            cls_frame=cls_frame, base_patch_size=args.patch_size,
         )
         grand_keep += keep
         grand_dense += dense

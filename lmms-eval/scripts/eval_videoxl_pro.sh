@@ -10,7 +10,8 @@ export HF_HOME=/mnt/SSD2/huggingface
 
 export CUDA_VISIBLE_DEVICES=0,2
 # --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,use_rlt=True,rlt_threshold=0.2 \
-
+# --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt=True,apt_threshold=4.0:6.0,apt_num_scales=3 \
+# --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,use_rlt=True,rlt_threshold=0.2 \
 
 LOG_DIR="./logs/videoxlpro_mlvu"
 mkdir -p "$LOG_DIR"
@@ -19,7 +20,7 @@ LOG_FILE="$LOG_DIR/eval_$(date +%Y%m%d_%H%M%S).log"
 accelerate launch --num_processes=2 --main_process_port 12345 \
     -m lmms_eval \
     --model videoxlpro \
-    --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt=True,apt_threshold=4.0:6.0,apt_num_scales=3 \
+    --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt_temporal=True,apt_threshold=4.0:6.0,apt_num_scales=3,rlt_threshold=0.2,apt_temporal_majority_ratio=0.5 \
     --tasks mlvu_test \
     --batch_size 1 \
     --log_samples \

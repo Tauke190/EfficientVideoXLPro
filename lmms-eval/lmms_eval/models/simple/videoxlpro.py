@@ -42,6 +42,9 @@ class VideoXLPro(lmms):
         apt_thresholds: Optional[str] = None,
         apt_num_scales: Optional[int] = 3,
         apt_input_res: Optional[int] = 392,
+        use_apt_temporal: Optional[bool] = False,
+        apt_temporal_majority_ratio: Optional[float] = 0.5,
+        apt_temporal_max_frames: Optional[int] = 512,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -81,8 +84,12 @@ class VideoXLPro(lmms):
         self._model.config.use_sae = use_sae
         self._model.config.use_rlt = use_rlt
         self._model.config.rlt_threshold = rlt_threshold
-        # APT (spatial adaptive patches) -- mutually exclusive with use_rlt.
-        assert not (use_rlt and use_apt), "use_rlt and use_apt are mutually exclusive; enable one at a time"
+        # APT (spatial adaptive patches) and APT-Temporal (APT + temporal
+        # redundancy collapsing on top) -- mutually exclusive with use_rlt
+        # and with each other, so each method's gain is measured independently.
+        assert sum([use_rlt, use_apt, use_apt_temporal]) <= 1, (
+            "use_rlt, use_apt, and use_apt_temporal are mutually exclusive; enable one at a time"
+        )
         self._model.config.use_apt = use_apt
         # Thresholds: one per non-base scale (apt_num_scales - 1). Avoid commas --
         # lmms_eval splits --model_args on commas. Either key works, and each may
@@ -99,6 +106,15 @@ class VideoXLPro(lmms):
         self._model.config.apt_thresholds = thresholds
         self._model.config.apt_num_scales = apt_num_scales
         self._model.config.apt_input_res = apt_input_res
+
+        # APT-Temporal (TAPT): reuses the same apt_thresholds/apt_num_scales/
+        # apt_input_res parsed above for its underlying spatial partition, and
+        # reuses rlt_threshold (set above) for its dirty-tile check -- both
+        # operate on the same SigLIP-normalized pixel scale, so it's one
+        # shared knob rather than a second, differently-scaled threshold.
+        self._model.config.use_apt_temporal = use_apt_temporal
+        self._model.config.apt_temporal_majority_ratio = apt_temporal_majority_ratio
+        self._model.config.apt_temporal_max_frames = apt_temporal_max_frames
         self.model.eval()
 
         self.batch_size_per_gpu = int(batch_size)
@@ -287,6 +303,19 @@ class VideoXLPro(lmms):
                     f"[APT] videos={gv}  encoder tokens kept={gk}/{gd} ({100.0*gk/gd:.1f}%)\n"
                     f"[APT] avg encoder survivors/video={gk//gv if gv else 0}\n"
                     f"[APT] ==========================\n",
+                    flush=True,
+                )
+
+        if getattr(self._model.config, "use_apt_temporal", False):
+            gk = getattr(self.model, "_apt_temporal_grand_keep", 0)
+            gd = getattr(self.model, "_apt_temporal_grand_dense", 0)
+            gv = getattr(self.model, "_apt_temporal_grand_videos", 0)
+            if gd > 0:
+                print(
+                    f"\n[APT-Temporal] ===== GRAND TOTAL =====\n"
+                    f"[APT-Temporal] videos={gv}  encoder tokens kept={gk}/{gd} ({100.0*gk/gd:.1f}%)\n"
+                    f"[APT-Temporal] avg encoder survivors/video={gk//gv if gv else 0}\n"
+                    f"[APT-Temporal] ==========================\n",
                     flush=True,
                 )
 
