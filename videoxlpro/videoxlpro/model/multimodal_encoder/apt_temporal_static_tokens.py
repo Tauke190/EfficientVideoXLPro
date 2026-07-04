@@ -28,10 +28,18 @@ t-1:
     "mergeable") while having changed completely since the previous frame (a
     flat region's value shifting) -- the temporal signal overrides the
     spatial merge decision here.
-  * shape mismatch + minority of subtiles dirty       -> OVERRIDE: adopt
-    frame t-1's scale/boundary instead of frame t's own (mismatched) one,
+  * shape mismatch + minority of subtiles dirty       -> OVERRIDE: still
+    merge at frame t's OWN scale (not t-1's -- see cell_dirty_stats'
+    docstring for why aggregating over t-1's footprint instead produced
+    inconsistent classification within a single one of frame t's cells),
     fresh-embed only the dirty minority sub-tiles, reuse cached embeddings
     for the quiet majority, tag as continuing the run.
+
+The majority-vote aggregation (cell_dirty_stats) is always keyed to frame t's
+OWN cell footprint (masks[ps][t]), same as shape_match -- this guarantees
+every base cell belonging to one of frame t's own cells gets the identical
+classification, which the embedding/merge pass in
+siglip_apt_temporal_embeddings.py depends on.
 
 The per-base-tile "did this change vs. the previous frame" signal is RLT's
 own existing primitive, reused UNCHANGED (rlt_static_tokens.batched_find_idxs_to_keep,
@@ -142,59 +150,62 @@ def shape_match_grid(scale_grid: torch.Tensor, masks: Dict[int, torch.Tensor],
     return out
 
 
-def reference_cell_dirty_stats(dirty: torch.Tensor, scale_grid: torch.Tensor,
-                                patch_sizes: List[int], base_patch_size: int,
-                                majority_ratio: float = 0.5) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-base-cell 'all quiet' / 'majority dirty', aggregated over the
-    PREVIOUS frame's cell footprint (scale_grid[t-1]) -- not frame t's own.
+def cell_dirty_stats(dirty: torch.Tensor, masks: Dict[int, torch.Tensor],
+                      patch_sizes: List[int], base_patch_size: int,
+                      majority_ratio: float = 0.5) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-base-cell 'all quiet' / 'majority dirty', aggregated over FRAME T's
+    OWN cell footprint (masks[ps][t]) -- deliberately NOT the previous frame's
+    footprint.
 
-    This is the candidate footprint actually being tested for continued
-    redundancy: whether shape_match holds or not, the question is always "did
-    the region frame t-1 treated as one cell change (a little / a lot)
-    relative to frame t?". Using frame t's OWN (possibly already-split) cells
-    for this aggregation would be wrong: if frame t's own entropy already
-    split a footprint into several finer cells, each of those would trivially
-    aggregate over itself alone (no vote at all), silently skipping the
-    majority-vote override this function exists to compute.
+    An earlier version of this function aggregated over scale_grid[t-1]'s
+    footprint instead, reasoning that "the candidate being tested for
+    redundancy is whatever t-1 treated as one cell." That's wrong: when frame
+    t's own entropy decides to MERGE a region that frame t-1 had split into
+    multiple, differently-scaled sub-cells, aggregating per t-1's (heterogeneous)
+    structure produces a DIFFERENT classification for different sub-tiles
+    within what is otherwise ONE of frame t's own cells -- which breaks the
+    invariant the embedding/merge pass depends on (every base cell in one of
+    frame t's own cells must resolve to the same decision, since they all
+    become ONE token together). Confirmed on real video: this produced base
+    cells with no valid packed row at all.
 
-    Returns (all_quiet, majority_dirty): each (T, G, G) bool, row 0 left False
-    (no t-1 to compare against; classify_cells forces frame 0 to FRESH
-    directly rather than relying on this function's degenerate output there).
+    Aggregating over frame t's own footprint instead guarantees uniformity by
+    construction, since shape_match/all_quiet/majority_dirty are then ALL
+    keyed to the exact same masks[ps][t] restriction. The one "degenerate"
+    case -- frame t's own cell is already at base scale (a mismatch that
+    resolved straight to individual tiles) -- just makes the FRESH/OVERRIDE
+    distinction a no-op for that tile (both fresh-embed it if dirty, both can
+    reuse cache if quiet); it does not reintroduce any inconsistency.
+
+    Returns (all_quiet, majority_dirty): each (T, G, G) bool, broadcast
+    uniformly over frame t's own cell footprint at whichever scale it is.
     """
     T, G, _ = dirty.shape
-    dirty_f = dirty.float()[1:]                                # dirty[t], aligned to t=1..T-1
-    prev_code = scale_grid[:-1].float()                         # scale_grid[t-1]
+    dirty_f = dirty.float()
     all_quiet = torch.zeros(T, G, G, dtype=torch.bool, device=dirty.device)
     majority_dirty = torch.zeros_like(all_quiet)
-    acc_quiet = torch.zeros(T - 1, G, G, dtype=torch.bool, device=dirty.device)
-    acc_majority = torch.zeros_like(acc_quiet)
-    for idx, ps in enumerate(patch_sizes):
-        code = idx + 1
+    for ps in patch_sizes:
         s = ps // base_patch_size
+        cur_mask = masks[ps].bool()                            # coarse grid (G/s, G/s)
         if s == 1:
             frac = dirty_f
-            code_mask = prev_code == code
+            mask_base = cur_mask
         else:
-            frac = F.avg_pool2d(dirty_f, kernel_size=s, stride=s)
-            min_pool = -F.max_pool2d(-prev_code, kernel_size=s, stride=s)
-            max_pool = F.max_pool2d(prev_code, kernel_size=s, stride=s)
-            code_mask_coarse = (min_pool == code) & (max_pool == code)
-            frac = frac.repeat_interleave(s, dim=1).repeat_interleave(s, dim=2)
-            code_mask = code_mask_coarse.repeat_interleave(s, dim=1).repeat_interleave(s, dim=2)
-        acc_quiet = acc_quiet | ((frac == 0) & code_mask)
-        acc_majority = acc_majority | ((frac > majority_ratio) & code_mask)
-    all_quiet[1:] = acc_quiet
-    majority_dirty[1:] = acc_majority
+            frac = F.avg_pool2d(dirty_f, kernel_size=s, stride=s)                # coarse grid
+            frac = frac.repeat_interleave(s, dim=1).repeat_interleave(s, dim=2)   # -> base grid
+            mask_base = cur_mask.repeat_interleave(s, dim=1).repeat_interleave(s, dim=2)  # -> base grid
+        all_quiet = all_quiet | ((frac == 0) & mask_base)
+        majority_dirty = majority_dirty | ((frac > majority_ratio) & mask_base)
     return all_quiet, majority_dirty
 
 
 def classify_cells(shape_match: torch.Tensor, all_quiet: torch.Tensor,
                     majority_dirty: torch.Tensor) -> torch.Tensor:
     """(T,G,G) long in {REDUNDANT, FRESH, OVERRIDE}. Frame 0 (no t-1 to compare
-    against) is forced to FRESH explicitly -- shape_match/all_quiet/majority_dirty
-    are all meaningless there (reference_cell_dirty_stats leaves row 0 at its
-    zero-initialized default), so this is an explicit special case rather than
-    relying on degenerate all-False algebra to happen to fall through to FRESH.
+    against) is forced to FRESH explicitly -- shape_match[0] is meaningless
+    there (shape_match_grid leaves row 0 at its zero-initialized default,
+    since there's no t-1), so this is an explicit special case rather than
+    relying on degenerate algebra to happen to fall through to FRESH.
     """
     redundant = shape_match & all_quiet
     fresh = (shape_match & ~all_quiet) | (~shape_match & majority_dirty)
@@ -245,13 +256,20 @@ def compute_run_lengths(is_new_token: torch.Tensor) -> torch.Tensor:
 if __name__ == "__main__":
     # ---- self-test: classification + run-length + origin-index consistency ----
     # 4x4 base grid (G=4), 2 scales (14/28) -> a 2x2 grid of 28px coarse cells,
-    # each spanning a 2x2 group of base cells. 3-frame clip: f0/f1 fully merged
-    # + identical (everything redundant). f2's masks/dirty are constructed BY
-    # HAND (rather than fought out of real entropy thresholds, which are
-    # finicky to tune blindly) so each quadrant exercises a specific path:
-    #   TR quadrant: independently split to base scale, 3/4 sub-tiles dirty -> FRESH
-    #   BL quadrant: independently split to base scale, 1/4 sub-tiles dirty -> OVERRIDE
-    #   TL, BR quadrants: stay merged, no dirty sub-tiles -> REDUNDANT
+    # each spanning a 2x2 group of base cells. 3-frame clip: f0/f1 IDENTICAL
+    # (TL/BR merged to 28px, TR/BL split to base -- everything redundant). f2's
+    # masks/dirty are constructed BY HAND (rather than fought out of real
+    # entropy thresholds, which are finicky to tune blindly) so each quadrant
+    # exercises a specific path:
+    #   TR quadrant: f2 MERGES to 28px (f1 had it split to base -> mismatch),
+    #                3/4 constituent tiles dirty -> majority -> FRESH
+    #   BL quadrant: f2 MERGES to 28px (f1 had it split to base -> mismatch),
+    #                1/4 constituent tiles dirty -> minority -> OVERRIDE
+    #   TL, BR quadrants: stay merged throughout, no dirty sub-tiles -> REDUNDANT
+    # Frame t's own cell must be the NON-base scale here (28px, not 14px) for
+    # the majority vote to be meaningful -- see cell_dirty_stats' docstring:
+    # aggregating over frame t's OWN footprint at BASE scale would trivially
+    # vote per-tile (fine, just not what this test is exercising).
     # This is a valid test of these primitives regardless of how masks/dirty
     # were obtained -- they don't care whether entropy or a human produced them.
     torch.manual_seed(0)
@@ -262,12 +280,15 @@ if __name__ == "__main__":
 
     masks_14 = torch.zeros(T, G, G)
     masks_28 = torch.zeros(T, G // 2, G // 2)
-    masks_28[0] = 1          # f0: fully merged
-    masks_28[1] = 1          # f1: fully merged (identical to f0 -> redundant)
-    masks_28[2, 0, 0] = 1    # f2 TL quadrant: stays merged
-    masks_28[2, 1, 1] = 1    # f2 BR quadrant: stays merged
-    masks_14[2, 0:2, 2:4] = 1   # f2 TR quadrant: split to base scale
-    masks_14[2, 2:4, 0:2] = 1   # f2 BL quadrant: split to base scale
+    for t in (0, 1):
+        masks_28[t, 0, 0] = 1        # TL: merged
+        masks_28[t, 1, 1] = 1        # BR: merged
+        masks_14[t, 0:2, 2:4] = 1    # TR: split to base (f0 == f1)
+        masks_14[t, 2:4, 0:2] = 1    # BL: split to base (f0 == f1)
+    masks_28[2, 0, 0] = 1    # f2 TL: stays merged
+    masks_28[2, 1, 1] = 1    # f2 BR: stays merged
+    masks_28[2, 0, 1] = 1    # f2 TR: NOW MERGES to 28px (mismatch vs f1's split)
+    masks_28[2, 1, 0] = 1    # f2 BL: NOW MERGES to 28px (mismatch vs f1's split)
     masks = {14: masks_14, 28: masks_28}
 
     scale_grid = dense_scale_code_grid(masks, patch_sizes, base_p)
@@ -282,8 +303,8 @@ if __name__ == "__main__":
     print("dirty:\n", dirty)
 
     shape_match = shape_match_grid(scale_grid, masks, patch_sizes, base_p)
-    all_quiet, majority_dirty = reference_cell_dirty_stats(
-        dirty, scale_grid, patch_sizes, base_p, majority_ratio=0.5
+    all_quiet, majority_dirty = cell_dirty_stats(
+        dirty, masks, patch_sizes, base_p, majority_ratio=0.5
     )
     cls = classify_cells(shape_match, all_quiet, majority_dirty)
     print("classification (0=REDUNDANT,1=FRESH,2=OVERRIDE):\n", cls)

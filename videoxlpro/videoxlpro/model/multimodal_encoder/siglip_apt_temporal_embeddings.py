@@ -11,12 +11,18 @@ This module **composes** an already-built SiglipAPTEmbeddings instance --
 no changes to siglip_apt_embeddings.py are needed. It reuses:
   * apt.tokenizer          (APTPatchTokenizer -- entropy/partition + patch
                              grouping, including construct_patch_groups'
-                             existing support for applying an EXTERNALLY
-                             supplied mask to a frame's pixels, which is
-                             exactly what's needed to compute the E(Resize_p)
-                             "coarse anchor" term for a merged token whose
-                             cell footprint may differ from frame t's own
-                             partition, e.g. after an OVERRIDE event).
+                             existing support for applying an externally
+                             supplied mask to a frame's pixels, used here to
+                             compute the E(Resize_p) "coarse anchor" term for
+                             just the subset of frame t's own cells that need
+                             a fresh/refreshed token this frame -- see
+                             cell_dirty_stats' docstring for why OVERRIDE
+                             always uses frame t's OWN scale/boundary, never
+                             frame t-1's: an earlier version adopted t-1's
+                             boundary and produced inconsistent classification
+                             within one of frame t's own cells whenever frame
+                             t merged a region t-1 had split into multiple,
+                             differently-scaled sub-cells).
   * apt._embed_patches      (frozen SigLIP patch_embedding Conv2d -- never
                              shown anything but a native 14x14 patch).
   * apt.patch_attn / apt.zero_conv  (APT's trainable, zero-init spatial merge
@@ -54,7 +60,7 @@ try:
     from .apt_temporal_static_tokens import (
         REDUNDANT, FRESH, OVERRIDE,
         dense_scale_code_grid, dirty_subtile_mask, shape_match_grid,
-        reference_cell_dirty_stats, classify_cells,
+        cell_dirty_stats, classify_cells,
         compute_origin_index, compute_run_lengths,
     )
 except ImportError:  # allow running this file directly as a script for testing
@@ -62,7 +68,7 @@ except ImportError:  # allow running this file directly as a script for testing
     from apt_temporal_static_tokens import (
         REDUNDANT, FRESH, OVERRIDE,
         dense_scale_code_grid, dirty_subtile_mask, shape_match_grid,
-        reference_cell_dirty_stats, classify_cells,
+        cell_dirty_stats, classify_cells,
         compute_origin_index, compute_run_lengths,
     )
 
@@ -175,8 +181,11 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
         dirty = dirty_subtile_mask(frames.float(), self.threshold, base_p)
 
         shape_match = shape_match_grid(scale_grid, masks, apt.patch_sizes, base_p)
-        all_quiet, majority_dirty = reference_cell_dirty_stats(
-            dirty, scale_grid, apt.patch_sizes, base_p, self.majority_ratio
+        # Aggregated over frame t's OWN cell footprint (masks[ps][t]), not
+        # frame t-1's -- see cell_dirty_stats' docstring for why the latter
+        # produces inconsistent classification within one of frame t's cells.
+        all_quiet, majority_dirty = cell_dirty_stats(
+            dirty, masks, apt.patch_sizes, base_p, self.majority_ratio
         )
         cls = classify_cells(shape_match, all_quiet, majority_dirty)
 
@@ -185,11 +194,6 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
         tile_source_frame = compute_origin_index(needs_fresh_embed)
         token_origin_frame = compute_origin_index(is_new_token)
         run_length = compute_run_lengths(is_new_token)
-
-        # OVERRIDE events adopt frame t-1's own scale/boundary instead of
-        # frame t's (mismatched) one; FRESH/REDUNDANT keep frame t's own.
-        adopted_scale_grid = scale_grid.clone()
-        adopted_scale_grid[1:] = torch.where(cls[1:] == OVERRIDE, scale_grid[:-1], scale_grid[1:])
 
         # ---- base-tile embedding cache: E(patch)+pos, computed once per
         # position wherever needed, gathered forward via tile_source_frame
@@ -214,9 +218,9 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
         for idx, ps in enumerate(apt.patch_sizes):
             code = idx + 1
             s = ps // base_p
-            coarse_adopted = adopted_scale_grid[:, ::s, ::s]
+            coarse_code = scale_grid[:, ::s, ::s]
             coarse_new = is_new_token[:, ::s, ::s]
-            event_mask = (coarse_adopted == code) & coarse_new            # (T, G//s, G//s)
+            event_mask = (coarse_code == code) & coarse_new                # (T, G//s, G//s)
             n_events = int(event_mask.sum().item())
             scale_events.append((event_mask, s))
             if n_events == 0:

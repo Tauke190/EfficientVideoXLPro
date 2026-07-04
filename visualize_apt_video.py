@@ -83,7 +83,7 @@ from apt_static_tokens import compute_patch_entropy_batched, select_patches_by_t
 from apt_temporal_static_tokens import (  # noqa: E402
     REDUNDANT, FRESH, OVERRIDE,
     dense_scale_code_grid, dirty_subtile_mask, shape_match_grid,
-    reference_cell_dirty_stats, classify_cells,
+    cell_dirty_stats, classify_cells,
 )
 
 # Per-scale overlay colors in RGB (finest -> coarsest).
@@ -194,8 +194,8 @@ def compute_temporal_classification(sq_frames, patch_sizes, base_patch_size, num
     scale_grid = dense_scale_code_grid(masks, patch_sizes, base_patch_size)
     dirty = dirty_subtile_mask(t, pixel_threshold, base_patch_size)
     shape_match = shape_match_grid(scale_grid, masks, patch_sizes, base_patch_size)
-    all_quiet, majority_dirty = reference_cell_dirty_stats(
-        dirty, scale_grid, patch_sizes, base_patch_size, majority_ratio
+    all_quiet, majority_dirty = cell_dirty_stats(
+        dirty, masks, patch_sizes, base_patch_size, majority_ratio
     )
     cls = classify_cells(shape_match, all_quiet, majority_dirty)
     return cls.detach().cpu().numpy()
