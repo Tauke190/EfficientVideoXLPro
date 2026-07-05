@@ -1764,7 +1764,7 @@ def train(attn_implementation=None):
         if getattr(model.config, "use_rlt", False):
             phi_L = model.get_model().get_rlt_length_embed()
             phi_L.requires_grad_(True)
-            rank0_print(f"[RLT] learnable run-length encoding phi_L registered (shape={tuple(phi_L.shape)}) and unfrozen.")
+            rank0_print(f"[RLT] learnable run-length encoding phi_L registered (shape={tuple(phi_L.weight.shape)}) and unfrozen.")
 
         # APT-Temporal's run-length embedding: same reasoning as phi_L above.
         # NOTE: patch_attn/zero_conv (APT's own spatial merge) stay untouched --
