@@ -310,12 +310,21 @@ class LLaVATrainer(Trainer):
     
 
     @torch.no_grad()
-    def evaluate(self, eval_dataset: Dataset | None = None, ignore_keys: List[str] | None = None, metric_key_prefix: str = "eval") -> Dict[str, float]:        
-        # memory metrics - must set up as early as possible
-        self._memory_tracker.start()
-
+    def evaluate(self, eval_dataset: Dataset | None = None, ignore_keys: List[str] | None = None, metric_key_prefix: str = "eval") -> Dict[str, float]:
         if eval_dataset is None and self.eval_dataset is None:
             return
+
+        if not hasattr(self.model, "memory"):
+            # Plain (non-beacon) models -- e.g. the RLT/APT LlavaQwenForCausalLM path --
+            # have no memory/beacon mechanism for the eval_method branches below to
+            # drive; fall back to HF Trainer's standard loss-based eval loop instead
+            # of crashing on self.model.memory / self.args.eval_method, which don't
+            # exist for this architecture. Let the base impl own its own memory-tracker
+            # start/stop rather than double-starting it here.
+            return super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+
+        # memory metrics - must set up as early as possible
+        self._memory_tracker.start()
 
         if self.args.eval_method == "generation":
             labels = self.eval_dataset["labels"]

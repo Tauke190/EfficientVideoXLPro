@@ -160,6 +160,8 @@ class DataArguments:
     video_fps: Optional[int] = field(default=1)
     frames_upbound: Optional[int] = field(default=0)
 
+    eval_num_samples: int = field(default=0, metadata={"help": "Hold out this many samples from data_path (fixed seed) as eval_dataset for HF Trainer's built-in eval loop. 0 = no held-out split (all data trains, eval_dataset=None), matching prior behavior."})
+
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -1350,7 +1352,24 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+
+    eval_dataset = None
+    if data_args.eval_num_samples > 0:
+        # Fixed seed so the same rows are held out across restarts/resumes, and a
+        # shallow copy so eval_dataset shares train_dataset's tokenizer/data_args
+        # but gets its own disjoint list_data_dict (no aliasing between the two).
+        n_eval = min(data_args.eval_num_samples, len(train_dataset.list_data_dict) // 10)
+        shuffled = train_dataset.list_data_dict[:]
+        random.Random(42).shuffle(shuffled)
+        eval_dataset = copy.copy(train_dataset)
+        eval_dataset.list_data_dict = shuffled[:n_eval]
+        train_dataset.list_data_dict = shuffled[n_eval:]
+        rank0_print(
+            f"[eval] held out {len(eval_dataset.list_data_dict)} samples as eval_dataset "
+            f"(train_dataset now {len(train_dataset.list_data_dict)} samples)"
+        )
+
+    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 
 def get_model(model_args, training_args, bnb_model_from_pretrained_args):
@@ -1507,6 +1526,19 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
     return model
 
+
+class RLTLengthEmbedDebugCallback(transformers.TrainerCallback):
+    """Every `every_n_steps`, prints the per-run-length mean abs weight of phi_L
+    (rlt_length_embed). Zero-init, so a cheap way to see whether it's actually
+    receiving gradient signal without waiting on a full lmms-eval pass."""
+
+    def __init__(self, every_n_steps: int = 1000):
+        self.every_n_steps = every_n_steps
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if state.global_step % self.every_n_steps == 0 and args.local_rank in (-1, 0):
+            phi_L = model.get_model().rlt_length_embed
+            rank0_print(f"[RLT] step={state.global_step} phi_L per-length mean(|weight|)={phi_L.weight.abs().mean(dim=-1)}")
 
 
 def train(attn_implementation=None):
@@ -1818,7 +1850,9 @@ def train(attn_implementation=None):
         model_args=model_args,
         **data_module
     )
- 
+
+    if getattr(model.config, "use_rlt", False):
+        trainer.add_callback(RLTLengthEmbedDebugCallback(every_n_steps=1000))
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
