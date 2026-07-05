@@ -505,7 +505,7 @@ class LlavaMetaForCausalLM(ABC):
             vt = self.get_model().get_vision_tower()
             apt = SiglipAPTEmbeddings(
                 vt.vision_tower,
-                thresholds=getattr(self.config, "apt_thresholds", [4.0, 4.0]),
+                thresholds=getattr(self.config, "apt_thresholds", [4.0, 6.0]),
                 num_scales=getattr(self.config, "apt_num_scales", 3),
                 base_patch_size=getattr(self.config, "apt_base_patch_size", 14),
                 image_size=getattr(self.config, "apt_input_res", 392),
@@ -539,11 +539,6 @@ class LlavaMetaForCausalLM(ABC):
             n_keep, n_dense = int(output_mask.numel()), int(T * P)
             total_keep += n_keep
             total_dense += n_dense
-            rank0_print(
-                f"[APT+DTS] clip={i} frames={T} thresholds={apt.tokenizer.thresholds} "
-                f"encoder survivors={n_keep}/{n_dense} ({100.0*n_keep/n_dense:.1f}% kept) "
-                f"-> scatter-back to dense ({T}, {P}, C) -> DTS"
-            )
             dense_clips.append(
                 apt_scatter_back(survivors, output_mask, masks, apt.base_patch_size, apt.image_size)
             )
@@ -551,10 +546,6 @@ class LlavaMetaForCausalLM(ABC):
         self._apt_grand_keep = getattr(self, "_apt_grand_keep", 0) + total_keep
         self._apt_grand_dense = getattr(self, "_apt_grand_dense", 0) + total_dense
         self._apt_grand_videos = getattr(self, "_apt_grand_videos", 0) + len(per_clip_frames)
-        rank0_print(
-            f"[APT+DTS] TOTAL encoder survivors={total_keep}/{total_dense} "
-            f"({100.0*total_keep/total_dense:.1f}% kept); DTS compresses the dense grid next."
-        )
         return tuple(dense_clips)
 
     def _get_apt_temporal_module(self):

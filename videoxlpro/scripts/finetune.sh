@@ -10,7 +10,7 @@ MODEL_PATH="MINT-SJTU/Video-XL-Pro-3B"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
 PROMPT_VERSION=qwen_1_5
-MID_RUN_NAME="videoxlpro-3b-finetune-llava665k"
+MID_RUN_NAME="videoxlpro-3b-finetune-llava665k&llavaimages"
 
 echo "Fine-tuning run: ${MID_RUN_NAME}"
 

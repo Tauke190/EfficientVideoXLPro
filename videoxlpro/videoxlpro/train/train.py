@@ -124,7 +124,7 @@ class ModelArguments:
     # LlavaMetaModel.get_apt_patch_attn/get_apt_zero_conv in llava_arch.py) and
     # unfrozen below, same treatment as RLT's phi_L.
     use_apt: bool = field(default=False)
-    apt_thresholds: Optional[str] = field(default="4.0,4.0", metadata={"help": "Comma-separated entropy thresholds, one per non-base scale (len = apt_num_scales-1)."})
+    apt_thresholds: Optional[str] = field(default="4.0,6.0", metadata={"help": "Comma-separated entropy thresholds, one per non-base scale (len = apt_num_scales-1)."})
     apt_num_scales: int = field(default=3)
     apt_base_patch_size: int = field(default=14)
     apt_input_res: int = field(default=392)
@@ -1530,6 +1530,17 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     return model
 
 
+class StepLoggingCallback(transformers.TrainerCallback):
+    """Prints global_step alongside every logged metrics dict (loss, grad_norm,
+    eval_loss, ...). HF Trainer only mixes `step` into state.log_history, not
+    into the `logs` dict handlers receive, so plain console/slurm stdout has no
+    step number to correlate lines against -- this makes it explicit."""
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is not None and args.local_rank in (-1, 0):
+            rank0_print(f"[step={state.global_step}] {logs}")
+
+
 class RLTLengthEmbedDebugCallback(transformers.TrainerCallback):
     """Every `every_n_steps`, prints the per-run-length mean abs weight of phi_L
     (rlt_length_embed). Zero-init, so a cheap way to see whether it's actually
@@ -1865,6 +1876,8 @@ def train(attn_implementation=None):
         model_args=model_args,
         **data_module
     )
+
+    trainer.add_callback(StepLoggingCallback())
 
     if getattr(model.config, "use_rlt", False):
         trainer.add_callback(RLTLengthEmbedDebugCallback(every_n_steps=1000))
