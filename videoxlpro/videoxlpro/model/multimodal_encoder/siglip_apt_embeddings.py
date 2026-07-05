@@ -41,7 +41,7 @@ Video-XL-Pro pipeline (interpolate -> add_video -> SAE -> 2D pool).  Wiring into
 llava_arch is a separate step.
 """
 
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -118,6 +118,15 @@ class SiglipAPTEmbeddings(nn.Module):
         image_size: APT input resolution (392 -> 28x28 base grid).
         apply_post_layernorm: Video-XL-Pro consumes hidden_states[-1] (pre-LN), so
             default False to match what the projector was trained on.
+        patch_attn: optional model-owned trainable Conv2d^i (see
+            LlavaMetaModel.get_apt_patch_attn). When given, this wrapper
+            references that module (so it stays in the base model's
+            named_parameters() -> optimizer + checkpoint, and DeepSpeed Zero-3
+            gathers it via the module's forward hook); when None, it creates its
+            own (standalone / eval use).
+        zero_conv: optional model-owned trainable ZeroMLP (see
+            LlavaMetaModel.get_apt_zero_conv), same sharing reasoning as
+            patch_attn above; when None, it creates its own zero-init Linear.
     """
 
     def __init__(
@@ -128,6 +137,8 @@ class SiglipAPTEmbeddings(nn.Module):
         base_patch_size: int = 14,
         image_size: int = 392,
         apply_post_layernorm: bool = False,
+        patch_attn: Optional[nn.Module] = None,
+        zero_conv: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         self.vision_model = vision_model
@@ -166,11 +177,22 @@ class SiglipAPTEmbeddings(nn.Module):
         self.register_buffer("base_pos_embed", base_pos, persistent=False)
         self.base_grid_size = new_g
 
-        # NEW trainable modules (the only params APT adds).
-        self.patch_attn = nn.Conv2d(self.embed_dim, self.embed_dim, kernel_size=2, stride=2)
-        self.zero_conv = nn.Linear(self.embed_dim, self.embed_dim)
-        nn.init.zeros_(self.zero_conv.weight)
-        nn.init.zeros_(self.zero_conv.bias)
+        # Trainable modules (the only params APT adds).
+        #   * patch_attn/zero_conv passed in -> reference the model-owned modules.
+        #     Stash in __dict__ so this (un-registered) wrapper's .to()/.cuda()
+        #     can't reprocess/break their sharing with the owner; gradients still
+        #     flow to them (same pattern as SiglipRLTEmbeddings.length_embed).
+        #   * both None -> own local copies (standalone/eval use, e.g. the
+        #     __main__ self-test below). zero_conv still zero-init so the
+        #     zero-init-at-seam property holds either way.
+        if patch_attn is not None and zero_conv is not None:
+            self.__dict__["patch_attn"] = patch_attn
+            self.__dict__["zero_conv"] = zero_conv
+        else:
+            self.patch_attn = nn.Conv2d(self.embed_dim, self.embed_dim, kernel_size=2, stride=2)
+            self.zero_conv = nn.Linear(self.embed_dim, self.embed_dim)
+            nn.init.zeros_(self.zero_conv.weight)
+            nn.init.zeros_(self.zero_conv.bias)
 
     # ------------------------------------------------------------------ #
     # SigLIP attention/encoder reuse (verbatim from siglip_rlt_embeddings.py)

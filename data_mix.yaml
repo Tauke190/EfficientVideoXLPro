@@ -1,7 +1,7 @@
 datasets:
   # Image instruction data (LLaVA 665K, minus missing OCR-VQA images)
-  # - json_path: /home/av354855/EfficientVideoXLPro/llava_v1_5_mix665k_img_only_fifth.json
-  #   sampling_strategy: all
+  - json_path: /home/av354855/EfficientVideoXLPro/llava_v1_5_mix665k_img_only_fifth.json
+    sampling_strategy: all
   # Ego4D video instruction data (built from narrations)
   - json_path: /home/av354855/EfficientVideoXLPro/ego4d_video_qa.json
     sampling_strategy: all

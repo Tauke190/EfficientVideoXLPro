@@ -60,7 +60,14 @@ class LlavaMetaModel:
                 # run-length embedding (a separate table from RLT's, so the two
                 # modes -- mutually exclusive -- each get their own trained bias).
                 self.get_apt_temporal_reuse_embed()
-    
+
+            if getattr(config, "use_apt", False):
+                # Same reasoning as RLT's phi_L above: own patch_attn/zero_conv
+                # here (not inside the unregistered APT wrapper) so trained-APT
+                # checkpoints load their weights and DeepSpeed Zero-3 gathers them.
+                self.get_apt_patch_attn()
+                self.get_apt_zero_conv()
+
         # self.llm_tokenizer = AutoTokenizer.from_pretrained(config._name_or_path)
         self.hidden_size=config.hidden_size
         # print(config)
@@ -129,6 +136,40 @@ class LlavaMetaModel:
             nn.init.zeros_(emb.weight)
             self.apt_temporal_reuse_embed = emb.to(device=vt.device, dtype=vt.dtype)
         return self.apt_temporal_reuse_embed
+
+    def get_apt_patch_attn(self):
+        """APT's trainable Conv2d^i (paper arXiv 2510.18091 Eq. 2, self.patch_attn).
+
+        Owned by the base model (not the APT wrapper, which is kept out of the
+        module registry like the RLT wrapper above) so it appears in
+        named_parameters() -> optimizer + checkpoint, and DeepSpeed Zero-3 gathers
+        it via its forward. Default (non-zero) Conv2d init is fine here: the
+        zero-init property of APT's merge comes entirely from zero_conv gating
+        this layer's output to 0, not from patch_attn itself (see get_apt_zero_conv).
+        """
+        if getattr(self, "apt_patch_attn", None) is None:
+            vt = self.get_vision_tower()
+            dim = getattr(vt, "hidden_size", None) or self.config.mm_hidden_size
+            conv = nn.Conv2d(dim, dim, kernel_size=2, stride=2)
+            self.apt_patch_attn = conv.to(device=vt.device, dtype=vt.dtype)
+        return self.apt_patch_attn
+
+    def get_apt_zero_conv(self):
+        """APT's trainable ZeroMLP (paper arXiv 2510.18091 Eq. 2, self.zero_conv).
+
+        Same ownership pattern as get_apt_patch_attn() above. Zero-init (weight
+        AND bias): a coarse token starts equal to E(Resize_p(P_i)) + pos, i.e.
+        enabling APT is a no-op at the seam until fine-tuning learns to fold in
+        sub-patch detail via patch_attn.
+        """
+        if getattr(self, "apt_zero_conv", None) is None:
+            vt = self.get_vision_tower()
+            dim = getattr(vt, "hidden_size", None) or self.config.mm_hidden_size
+            lin = nn.Linear(dim, dim)
+            nn.init.zeros_(lin.weight)
+            nn.init.zeros_(lin.bias)
+            self.apt_zero_conv = lin.to(device=vt.device, dtype=vt.dtype)
+        return self.apt_zero_conv
 
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_tower = model_args.vision_tower
@@ -441,29 +482,22 @@ class LlavaMetaForCausalLM(ABC):
             n_keep, n_dense = int(mask_flat.sum()), int(mask_flat.numel())
             total_keep += n_keep
             total_dense += n_dense
-            rank0_print(
-                f"[RLT+DTS] clip={i} frames={T} threshold={rlt.threshold} "
-                f"encoder survivors={n_keep}/{n_dense} ({100.0*n_keep/n_dense:.1f}% kept) "
-                f"-> scatter-back to dense ({T}, {P}, C) -> DTS"
-            )
             dense_clips.append(self._rlt_scatter_back(survivors, mask_flat, T, P))
         # Keep the grand-total counters live so the eval harness summary still works.
         self._rlt_grand_keep = getattr(self, "_rlt_grand_keep", 0) + total_keep
         self._rlt_grand_dense = getattr(self, "_rlt_grand_dense", 0) + total_dense
         self._rlt_grand_videos = getattr(self, "_rlt_grand_videos", 0) + len(per_clip_frames)
-        rank0_print(
-            f"[RLT+DTS] TOTAL encoder survivors={total_keep}/{total_dense} "
-            f"({100.0*total_keep/total_dense:.1f}% kept); DTS compresses the dense grid next."
-        )
         return tuple(dense_clips)
 
     def _get_apt_module(self):
         """Lazily build + cache the SigLIP-APT embedding module.
 
         Stored via __dict__ (not nn.Module's registry) so it does not re-register
-        the shared vision tower as a duplicate submodule. The APT-specific params
-        (patch_attn, zero_conv) on the returned module are the only trainable
-        additions; the SigLIP backbone stays frozen.
+        the shared vision tower as a duplicate submodule. patch_attn/zero_conv are
+        passed in from the base model's own get_apt_patch_attn()/get_apt_zero_conv()
+        (same reasoning as RLT's length_embed injection above) so they land in
+        named_parameters() -> optimizer + checkpoint instead of being orphaned
+        inside this unregistered wrapper.
         """
         apt = self.__dict__.get("_apt_module", None)
         if apt is None:
@@ -475,6 +509,8 @@ class LlavaMetaForCausalLM(ABC):
                 num_scales=getattr(self.config, "apt_num_scales", 3),
                 base_patch_size=getattr(self.config, "apt_base_patch_size", 14),
                 image_size=getattr(self.config, "apt_input_res", 392),
+                patch_attn=self.get_model().get_apt_patch_attn(),
+                zero_conv=self.get_model().get_apt_zero_conv(),
             ).to(device=vt.device, dtype=vt.dtype)
             self.__dict__["_apt_module"] = apt
         return apt

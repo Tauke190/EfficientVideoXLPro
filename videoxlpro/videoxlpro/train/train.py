@@ -120,9 +120,9 @@ class ModelArguments:
     # spatial quadtree merge. These fields previously had no CLI/dataclass home
     # at all (APT was only ever toggled at eval time via lmms-eval model_args);
     # added here as plain config passthroughs so a training script can set them.
-    # NOTE: this does NOT make patch_attn/zero_conv trainable -- they remain
-    # built inside the unregistered _get_apt_module() wrapper in llava_arch.py,
-    # untouched by this file, exactly as before.
+    # patch_attn/zero_conv are trainable: owned by the base model (see
+    # LlavaMetaModel.get_apt_patch_attn/get_apt_zero_conv in llava_arch.py) and
+    # unfrozen below, same treatment as RLT's phi_L.
     use_apt: bool = field(default=False)
     apt_thresholds: Optional[str] = field(default="4.0,4.0", metadata={"help": "Comma-separated entropy thresholds, one per non-base scale (len = apt_num_scales-1)."})
     apt_num_scales: int = field(default=3)
@@ -133,8 +133,8 @@ class ModelArguments:
     # resolved first) plus RLT-style temporal redundancy collapsing on top (see
     # apt_temporal_static_tokens.py for the classification precedence). Mutually
     # exclusive with use_rlt/use_apt (see llava_arch.py:encode_multimodals). Its
-    # run-length embedding IS trained (unlike patch_attn/zero_conv above) -- it's
-    # new functionality core to this feature, unfrozen below. Its dirty-tile
+    # own run-length embedding is trained too (separate table from RLT's phi_L
+    # and from APT's patch_attn/zero_conv above), unfrozen below. Its dirty-tile
     # check deliberately reuses rlt_threshold (above) rather than a second,
     # differently-scaled threshold -- both operate on the same SigLIP-normalized
     # pixel scale, answering the identical question ("did this patch change vs.
@@ -313,6 +313,9 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         # Same reasoning for APT-Temporal's own run-length embedding.
         if getattr(trainer.model.config, "use_apt_temporal", False):
             keys_to_match.append("apt_temporal_reuse_embed")
+        # Same reasoning for APT's patch_attn/zero_conv.
+        if getattr(trainer.model.config, "use_apt", False):
+            keys_to_match.extend(["apt_patch_attn", "apt_zero_conv"])
 
         weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
         trainer.model.config.save_pretrained(output_dir)
@@ -1713,8 +1716,8 @@ def train(attn_implementation=None):
         model.config.rlt_max_frames = model_args.rlt_max_frames
         model.config.rlt_patch_size = model_args.rlt_patch_size
 
-        # APT config -> model.config (plain passthrough; patch_attn/zero_conv
-        # trainability is unaffected, see the ModelArguments field comments).
+        # APT config -> model.config (patch_attn/zero_conv trainability is handled
+        # below, same as RLT's phi_L; see the ModelArguments field comments).
         model.config.use_apt = model_args.use_apt
         apt_thresholds = [float(p) for p in str(model_args.apt_thresholds).replace(",", ":").split(":") if p != ""]
         n_needed = model_args.apt_num_scales - 1
@@ -1798,9 +1801,21 @@ def train(attn_implementation=None):
             phi_L.requires_grad_(True)
             rank0_print(f"[RLT] learnable run-length encoding phi_L registered (shape={tuple(phi_L.weight.shape)}) and unfrozen.")
 
+        # APT: patch_attn (Conv2d^i) and zero_conv (ZeroMLP) are the trainable
+        # compensation for the quadtree merge (paper arXiv 2510.18091 Eq. 2). Same
+        # reasoning as RLT's phi_L above -- keep them trainable whenever APT is
+        # enabled, regardless of which other parts mm_tunable_parts covers.
+        if getattr(model.config, "use_apt", False):
+            apt_patch_attn = model.get_model().get_apt_patch_attn()
+            apt_zero_conv = model.get_model().get_apt_zero_conv()
+            apt_patch_attn.requires_grad_(True)
+            apt_zero_conv.requires_grad_(True)
+            rank0_print(
+                f"[APT] learnable patch_attn (shape={tuple(apt_patch_attn.weight.shape)}) and "
+                f"zero_conv (shape={tuple(apt_zero_conv.weight.shape)}) registered and unfrozen."
+            )
+
         # APT-Temporal's run-length embedding: same reasoning as phi_L above.
-        # NOTE: patch_attn/zero_conv (APT's own spatial merge) stay untouched --
-        # only this new run-length embedding is unfrozen here.
         if getattr(model.config, "use_apt_temporal", False):
             tapt_reuse = model.get_model().get_apt_temporal_reuse_embed()
             tapt_reuse.requires_grad_(True)

@@ -1,76 +1,28 @@
-#!/bin/bash
-#SBATCH --job-name=videoxlpro
-#SBATCH --output=/home/av354855/EfficientVideoXLPro/slurmlogs/videoxlpro-%j.out
-#SBATCH --gres-flags=enforce-binding
-#SBATCH -p gpu
-#SBATCH -C gmem80
-#SBATCH --gres=gpu:2
-#SBATCH --mem-per-cpu=10G
-#SBATCH --cpus-per-gpu=8
-
-# Starting from the pre-trained Video-XL-Pro-3B checkpoint (skips pretrain stage)
-
-
-PORT=$((RANDOM % 10000 + 20000))
-while ss -tuln | grep -q ":$PORT"; do
-  PORT=$((RANDOM % 10000 + 20000))
-done
-echo "Free port found: $PORT"
-
-# Load necessary modules
-module load anaconda3
-# torch is built with cu121, so load a CUDA 12.x toolkit (default 'cuda' resolves to 13.x and
-# breaks DeepSpeedCPUAdam's JIT build). 12.2 is the closest available minor to 12.1.
-module load cuda/12.2
-
-eval "$(conda shell.bash hook)"
-
-# Activate your conda environment
-conda activate videoxlpro
-
-
-echo "Job started at $(date)"
-echo "Running on node: $(hostname)"
-echo "GPU info:"
-nvidia-smi
-
-echo "Checking PyTorch CUDA version and availability:"
-python -c "import torch; print('torch.version.cuda:', torch.version.cuda); print('torch.cuda.is_available:', torch.cuda.is_available())"
-
-# Change directory
-cd /home/av354855/EfficientVideoXLPro/videoxlpro
-
-export NUM_GPUS=2
+export NUM_GPUS=1
 export NNODES=1
 export RANK=0
 export ADDR=localhost
+export PORT=12344
 
-# Bypass DeepSpeed's strict CUDA version-string check; safe because the loaded toolkit (12.x)
-# matches torch's CUDA major version (cu121). Needed for the cpu_adam JIT build under offload.
-export DS_SKIP_CUDA_CHECK=1
-# Reduce CUDA allocator fragmentation (the original OOM had >1GB reserved-but-unallocated).
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-# /mnt/SSD2/huggingface/hub/models--MINT-SJTU--Video-XL-Pro-3B/snapshots/d9914fb2249a9de39daac33a3e02a34a991524db
+# Starting from the pre-trained Video-XL-Pro-3B checkpoint (skips pretrain stage)
 MODEL_PATH="MINT-SJTU/Video-XL-Pro-3B"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
 PROMPT_VERSION=qwen_1_5
-MID_RUN_NAME="videoxlpro-3b-finetune-rlt-ego4d"
+MID_RUN_NAME="videoxlpro-3b-apt-only-ego4d"
 
 echo "Fine-tuning run: ${MID_RUN_NAME}"
 
 ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NNODES}" --node_rank="${RANK}" --master_addr="${ADDR}" --master_port="${PORT}" \
     videoxlpro/train/train_mem.py \
     --deepspeed scripts/zero3.json \
-    --use_rlt True \
+    --use_apt True \
     --model_name_or_path ${MODEL_PATH} \
     --version ${PROMPT_VERSION} \
     --data_path /home/av354855/EfficientVideoXLPro/data_mix.yaml \
     --image_folder /home/c3-0/datasets/llava_665K/playground/data \
     --video_folder /home/c3-0/datasets/Ego4D/videos/h264 \
-    --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_language_model" \
-    --mm_vision_tower_lr=2e-6 \
+    --mm_tunable_parts="none" \
     --frames_upbound 32 \
     --video_fps 1 \
     --vision_tower ${VISION_MODEL_VERSION} \
@@ -99,7 +51,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --save_strategy "steps" \
     --save_steps 3000 \
     --save_total_limit 2 \
-    --learning_rate 1e-5 \
+    --learning_rate 1e-6 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
@@ -112,4 +64,3 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --report_to wandb \
     --dataloader_drop_last True \
     --attn_implementation flash_attention_2
-conda deactivate
