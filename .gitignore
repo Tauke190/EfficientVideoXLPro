@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model weights / checkpoints
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.h5
+*.onnx
+*.npy
+*.npz
+videoxlpro/outputs/
+
+# Large media / data files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# Logs / experiment tracking
+*.log
+logs/
+wandb/
+runs/
+
+# Caches
+.cache/
+cache/
+
+# OS / editor junk
+.DS_Store
+.idea/
+.vscode/
