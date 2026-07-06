@@ -23,7 +23,7 @@ accelerate launch --num_processes=2 --main_process_port 12345 \
     -m lmms_eval \
     --model videoxlpro \
     --tasks mlvu_test \
-    --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=16,attn_implementation=flash_attention_2,use_sae=False \
+    --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=False \
     --batch_size 1 \
     --log_samples \
     --log_samples_suffix videoxlpro_mlvu \
