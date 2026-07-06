@@ -1,0 +1,2 @@
+git diff
+scp -r av354855@crcv.eecs.ucf.edu:/home/av354855/EfficientVideoXLPro/videoxlpro/outputs/checkpoints/videoxlpro-3b-finetune-llava665k /home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/

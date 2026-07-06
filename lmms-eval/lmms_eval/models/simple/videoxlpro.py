@@ -7,7 +7,10 @@ import torch
 from accelerate import Accelerator, DistributedType, InitProcessGroupKwargs
 from accelerate.state import AcceleratorState
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+
 
 warnings.filterwarnings("ignore")
 
@@ -68,7 +71,11 @@ class VideoXLPro(lmms):
         self.use_cache = use_cache
         self.use_sae = use_sae
 
-        self._model = AutoModelForCausalLM.from_pretrained(
+        
+        config = AutoConfig.from_pretrained(pretrained, trust_remote_code=True)
+        model_class = get_class_from_dynamic_module(config.auto_map["AutoModelForCausalLM"], pretrained)
+
+        self._model = model_class.from_pretrained(
             pretrained,
             low_cpu_mem_usage=True,
             torch_dtype=torch.float16,

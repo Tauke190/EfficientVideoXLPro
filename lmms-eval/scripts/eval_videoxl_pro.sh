@@ -4,15 +4,17 @@ export PYTHONPATH=/home/av354855/projects/Video-XL-Pro:$PYTHONPATH
 export HF_HOME=/mnt/SSD2/huggingface
 
 # For HPC 
-# export PYTHONPATH=/home/av354855/lmms-eval/Video-XL/Video-XL-Pro:$PYTHONPATH
+# export PYTHONPATH=/home/av354855/EfficientVideoXLPro:$PYTHONPATH
 # export HF_HOME=/home/c3-0/datasets/huggingface
-# use_sae=True
 
 export CUDA_VISIBLE_DEVICES=0,2
 # --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,use_rlt=True,rlt_threshold=0.2 \
 # --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt=True,apt_threshold=4.0:6.0,apt_num_scales=3 \
 # --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,use_rlt=True,rlt_threshold=0.2 \
+# --model_args pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-finetune-llava665k,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=False,use_rlt=True,rlt_threshold=0.3 \
+# --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True \
 
+# use_apt_temporal
 LOG_DIR="./logs/videoxlpro_mlvu"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/eval_$(date +%Y%m%d_%H%M%S).log"
@@ -20,8 +22,8 @@ LOG_FILE="$LOG_DIR/eval_$(date +%Y%m%d_%H%M%S).log"
 accelerate launch --num_processes=2 --main_process_port 12345 \
     -m lmms_eval \
     --model videoxlpro \
-    --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt_temporal=True,apt_threshold=4.0:6.0,apt_num_scales=3,rlt_threshold=0.2,apt_temporal_majority_ratio=0.5 \
     --tasks mlvu_test \
+    --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=16,attn_implementation=flash_attention_2,use_sae=False \
     --batch_size 1 \
     --log_samples \
     --log_samples_suffix videoxlpro_mlvu \
