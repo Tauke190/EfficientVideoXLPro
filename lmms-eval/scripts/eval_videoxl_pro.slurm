@@ -43,6 +43,8 @@ python -c "import torch; print('torch.version.cuda:', torch.version.cuda); print
 cd /home/av354855/EfficientVideoXLPro/lmms-eval
 
 export PYTHONPATH=/home/av354855/EfficientVideoXLPro:$PYTHONPATH
+export HF_HOME=/home/av354855/.cache/huggingface
+
 
 # ---- Ablation variants (uncomment one --model_args below; keep the rest commented) ----
 # --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,use_rlt=True,rlt_threshold=0.2 \
