@@ -1593,25 +1593,47 @@ class AptModuleNormCallback(transformers.TrainerCallback):
                 self._init_flat[name] = flat
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        metrics = {}
+        stats = {}   # param name -> (weight-norm, distance-from-init)
         for name, param in self._targets():
             cur = self._gathered(param)                # collective: all ranks participate
             if args.local_rank not in (-1, 0):
                 continue
-            short = "_".join(name.split(".")[-2:])     # e.g. apt_zero_conv_weight
-            metrics[f"apt/{short}_wnorm"] = float(cur.norm())
             init = self._init_flat.get(name)
-            if init is not None and init.numel() == cur.numel():
-                metrics[f"apt/{short}_wdelta_from_init"] = float((cur - init).norm())
-        if args.local_rank not in (-1, 0) or not metrics:
+            wnorm = float(cur.norm())
+            wdelta = float((cur - init).norm()) if (init is not None and init.numel() == cur.numel()) else wnorm
+            stats[name] = (wnorm, wdelta)
+        if args.local_rank not in (-1, 0) or not stats:
             return
+
+        # Keep only the two headline numbers (ASCII acronyms, no unicode -> safe
+        # under LANG=C on HPC): ZC = zero_conv weight norm (the canary; starts at
+        # exactly 0, so its norm IS its movement) and PA = patch_attn weight
+        # distance travelled from init (its norm is ~constant, so the delta is the
+        # informative bit). RL = APT-Temporal run-length embed norm (temporal runs).
+        def pick(substr, which):
+            for n, (wn, wd) in stats.items():
+                if substr in n and n.endswith(".weight"):
+                    return wn if which == "norm" else wd
+            return None
+
+        metrics, parts = {}, []
+        zc = pick("apt_zero_conv", "norm")
+        pa = pick("apt_patch_attn", "delta")
+        rl = pick("apt_temporal_reuse_embed", "norm")
+        if zc is not None:
+            metrics["apt/zc_wnorm"] = zc; parts.append(f"ZC_wnorm={zc:.3e}")
+        if pa is not None:
+            metrics["apt/pa_wdelta"] = pa; parts.append(f"PA_wdelta={pa:.3e}")
+        if rl is not None:
+            metrics["apt/reuse_wnorm"] = rl; parts.append(f"RL_wnorm={rl:.3e}")
+
         try:
             import wandb
             if wandb.run is not None:
                 wandb.log(metrics, step=state.global_step)
         except Exception:
             pass
-        rank0_print(f"[step={state.global_step}] APT-module norms: {metrics}")
+        rank0_print(f"[step={state.global_step}] APT {' '.join(parts)}")
 
 
 def train(attn_implementation=None):
