@@ -13,26 +13,18 @@ These are the *architecture-agnostic* math primitives of RLT. They are pure
 tensor ops (no xformers, no SigLIP weights) so they can be unit-tested in
 isolation and reused by the SigLIP integration module.
 
-Three functions:
-  * get_sinusoid_encoding      -- sinusoidal table for position / length embeds.
+Two functions:
+  * get_sinusoid_encoding      -- sinusoidal table for the temporal position embed.
   * batched_find_idxs_to_keep  -- boolean keep-mask over patch tokens.
-  * batched_get_token_lengths  -- run-length of each surviving token.
 
-Tensor-order conventions (important -- this is what keeps survivors, positions
-and lengths matchable by plain indexing):
+Tensor-order convention (important -- this is what keeps survivors and positions
+matchable by plain indexing):
 
   * batched_find_idxs_to_keep takes x as (B, C, T, H, W) and returns a mask of
     shape (B, T*h*w) in **(t, h, w)** raster order (t slowest, w fastest), where
-    h = H // patch_size, w = W // patch_size.
-
-  * batched_get_token_lengths returns a flat 1-D tensor of run-lengths in
-    **(h, w, t)** order (the reference's order, due to the (B,H,W,T) permute +
-    boolean-index). NOTE: this differs from the (t, h, w) order of the gathered
-    tokens; the SigLIP integration layer is responsible for reconciling the two
-    (see siglip_rlt_embeddings.py).
+    h = H // patch_size, w = W // patch_size. The SigLIP integration gathers
+    survivors with this same mask, so they stay in (t, h, w) order.
 """
-
-from typing import Tuple
 
 import torch
 import torch.nn.functional as F
@@ -102,40 +94,6 @@ def batched_find_idxs_to_keep(
     return keep_idxs
 
 
-def batched_get_token_lengths(
-    token_mask: torch.Tensor,
-    batch_size: int,
-    input_shape: Tuple[int, int, int],
-) -> torch.Tensor:
-    """Run-length (duration along T) of each surviving token.
-
-    Faithful port of rlt/src/models/static_token_utils.py:batched_get_token_lengths.
-
-    Args:
-        token_mask: (B, T'*h*w) bool keep-mask in (t, h, w) order.
-        batch_size: B.
-        input_shape: (T', h, w).
-
-    Returns:
-        diffs: 1-D long tensor of run-lengths, all batches concatenated, in
-            **(h, w, t)** order (see module docstring on the ordering caveat).
-            Values in [1, T'].
-    """
-    input_tensor = token_mask.reshape((batch_size,) + input_shape)   # (B, T', h, w)
-    input_tensor = input_tensor.permute(0, 2, 3, 1)                  # (B, h, w, T')
-    B, H, W, T = input_tensor.shape
-    # Concat ones at the end so terminal tokens close with length 1.
-    concat_tensor = torch.cat(
-        [input_tensor, torch.ones((B, H, W, 1), dtype=torch.uint8, device=input_tensor.device)],
-        dim=-1,
-    )
-    range_tensor = torch.arange(T + 1, device=input_tensor.device).reshape((1, 1, 1, T + 1))
-    range_tensor = range_tensor.repeat(B, H, W, 1)
-    diffs = range_tensor[concat_tensor.bool()].diff()
-    diffs = diffs[diffs > 0]
-    return diffs
-
-
 if __name__ == "__main__":
     # ---- self-test on a controlled synthetic clip --------------------------
     torch.manual_seed(0)
@@ -158,12 +116,8 @@ if __name__ == "__main__":
     for t in range(Tp):
         print(f"  t={t}: {keep[0, t].flatten().int().tolist()}")
 
-    lengths = batched_get_token_lengths(mask, batch_size=B, input_shape=(Tp, h, w))
     print(f"\nkept tokens: {int(mask.sum())} (dense={Tp*h*w})")
-    print(f"run-lengths (h,w,t order): {lengths.tolist()}")
-    print(f"sum run-lengths: {int(lengths.sum())} (== Tp*h*w = {Tp*h*w})")
-
-    assert int(mask.sum()) == lengths.numel(), "one length per surviving token"
-    assert int(lengths.sum()) == Tp * h * w, "run-lengths must tile the grid-time volume"
-    assert 1 <= int(lengths.min()) and int(lengths.max()) <= Tp
+    # frame 0 always kept (dummy first-frame rule); top-left keeps again at t=3.
+    assert keep[0, 0].all(), "first frame must always be kept"
+    assert int(mask.sum()) == h * w + 1, "only t=0 (all) + the top-left jump at t=3"
     print("\nOK: faithful RLT primitives are self-consistent.")

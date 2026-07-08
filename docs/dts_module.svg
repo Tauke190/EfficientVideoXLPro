@@ -1,0 +1,164 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 1110" font-family="'Segoe UI', system-ui, -apple-system, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <marker id="arrowlt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+    <filter id="sh" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="2.2" flood-color="#0f172a" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="860" height="1110" fill="#ffffff"/>
+
+  <!-- title -->
+  <text x="320" y="42" text-anchor="middle" font-size="23" font-weight="700" fill="#0f172a">DTS Module — SiglipAE</text>
+  <text x="320" y="66" text-anchor="middle" font-size="13" fill="#64748b">Learned temporal auto-encoder · fuses 4 frames → 1 in SigLIP feature space</text>
+  <text x="320" y="85" text-anchor="middle" font-size="11" fill="#94a3b8">videoxlpro/model/sae.py · runs after the SigLIP encoder, before mm_projector</text>
+
+  <!-- ===================== center column ===================== -->
+
+  <!-- INPUT -->
+  <g filter="url(#sh)">
+    <rect x="140" y="104" width="360" height="56" rx="10" fill="#e2e8f0" stroke="#475569" stroke-width="1.5"/>
+    <rect x="140" y="104" width="6" height="56" rx="3" fill="#475569"/>
+  </g>
+  <text x="320" y="128" text-anchor="middle" font-size="14" font-weight="700" fill="#1e293b">Input feature window</text>
+  <text x="320" y="147" text-anchor="middle" font-size="12" fill="#475569">(B, C=1152, T=4, H=24, W=24)</text>
+  <line x1="320" y1="160" x2="320" y2="184" stroke="#475569" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- POS ENCODING -->
+  <g filter="url(#sh)">
+    <rect x="140" y="186" width="360" height="50" rx="10" fill="#d1fae5" stroke="#10b981" stroke-width="1.5"/>
+    <rect x="140" y="186" width="6" height="50" rx="3" fill="#10b981"/>
+  </g>
+  <text x="320" y="207" text-anchor="middle" font-size="14" font-weight="700" fill="#065f46">＋ temporal_encoding</text>
+  <text x="320" y="225" text-anchor="middle" font-size="11" fill="#047857">learnable (4 × 1152), broadcast over H, W  ·  marks frame 0–3</text>
+  <line x1="320" y1="236" x2="320" y2="260" stroke="#475569" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- ===================== STAGE 1 ===================== -->
+  <rect x="120" y="262" width="400" height="286" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text x="136" y="284" font-size="12" font-weight="700" fill="#64748b" letter-spacing="1">STAGE 1</text>
+
+  <!-- AttnBlock3D -->
+  <g filter="url(#sh)">
+    <rect x="160" y="298" width="320" height="56" rx="9" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.4"/>
+    <rect x="160" y="298" width="6" height="56" rx="3" fill="#3b82f6"/>
+  </g>
+  <text x="320" y="321" text-anchor="middle" font-size="13.5" font-weight="700" fill="#1e3a8a">AttnBlock3D</text>
+  <text x="320" y="339" text-anchor="middle" font-size="10.5" fill="#1d4ed8">spatial self-attention within each frame (t folded into batch)</text>
+  <line x1="320" y1="354" x2="320" y2="376" stroke="#475569" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <!-- TemporalAttention -->
+  <g filter="url(#sh)">
+    <rect x="160" y="378" width="320" height="56" rx="9" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1.4"/>
+    <rect x="160" y="378" width="6" height="56" rx="3" fill="#8b5cf6"/>
+  </g>
+  <text x="320" y="401" text-anchor="middle" font-size="13.5" font-weight="700" fill="#5b21b6">TemporalAttention</text>
+  <text x="320" y="419" text-anchor="middle" font-size="10.5" fill="#6d28d9">attention across time · relative-position k/v · zero-init (identity @ start)</text>
+  <line x1="320" y1="434" x2="320" y2="456" stroke="#475569" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <!-- SamePadConv3d -->
+  <g filter="url(#sh)">
+    <rect x="160" y="458" width="320" height="56" rx="9" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.4"/>
+    <rect x="160" y="458" width="6" height="56" rx="3" fill="#f59e0b"/>
+  </g>
+  <text x="320" y="481" text-anchor="middle" font-size="13.5" font-weight="700" fill="#92400e">SamePadConv3d · stride (2,1,1)</text>
+  <text x="320" y="499" text-anchor="middle" font-size="10.5" fill="#b45309">3×3×3 conv · temporal downsample ×2 · T: 4 → 2 · fp32 · replicate pad</text>
+
+  <line x1="320" y1="548" x2="320" y2="576" stroke="#475569" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- ===================== STAGE 2 ===================== -->
+  <rect x="120" y="578" width="400" height="286" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text x="136" y="600" font-size="12" font-weight="700" fill="#64748b" letter-spacing="1">STAGE 2</text>
+
+  <!-- AttnBlock3D -->
+  <g filter="url(#sh)">
+    <rect x="160" y="614" width="320" height="56" rx="9" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.4"/>
+    <rect x="160" y="614" width="6" height="56" rx="3" fill="#3b82f6"/>
+  </g>
+  <text x="320" y="637" text-anchor="middle" font-size="13.5" font-weight="700" fill="#1e3a8a">AttnBlock3D</text>
+  <text x="320" y="655" text-anchor="middle" font-size="10.5" fill="#1d4ed8">spatial self-attention within each frame</text>
+  <line x1="320" y1="670" x2="320" y2="692" stroke="#475569" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <!-- TemporalAttention -->
+  <g filter="url(#sh)">
+    <rect x="160" y="694" width="320" height="56" rx="9" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1.4"/>
+    <rect x="160" y="694" width="6" height="56" rx="3" fill="#8b5cf6"/>
+  </g>
+  <text x="320" y="717" text-anchor="middle" font-size="13.5" font-weight="700" fill="#5b21b6">TemporalAttention</text>
+  <text x="320" y="735" text-anchor="middle" font-size="10.5" fill="#6d28d9">attention across time · relative-position k/v</text>
+  <line x1="320" y1="750" x2="320" y2="772" stroke="#475569" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <!-- SamePadConv3d -->
+  <g filter="url(#sh)">
+    <rect x="160" y="774" width="320" height="56" rx="9" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.4"/>
+    <rect x="160" y="774" width="6" height="56" rx="3" fill="#f59e0b"/>
+  </g>
+  <text x="320" y="797" text-anchor="middle" font-size="13.5" font-weight="700" fill="#92400e">SamePadConv3d · stride (2,1,1)</text>
+  <text x="320" y="815" text-anchor="middle" font-size="10.5" fill="#b45309">3×3×3 conv · temporal downsample ×2 · T: 2 → 1 · fp32 · replicate pad</text>
+
+  <line x1="320" y1="864" x2="320" y2="890" stroke="#475569" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- OUTPUT -->
+  <g filter="url(#sh)">
+    <rect x="140" y="892" width="360" height="58" rx="10" fill="#e2e8f0" stroke="#475569" stroke-width="1.5"/>
+    <rect x="140" y="892" width="6" height="58" rx="3" fill="#475569"/>
+  </g>
+  <text x="320" y="915" text-anchor="middle" font-size="14" font-weight="700" fill="#1e293b">Output → squeeze(2)</text>
+  <text x="320" y="934" text-anchor="middle" font-size="11.5" fill="#475569">(B, 1152, T=1, 24, 24)  →  (B, 1152, 24, 24)</text>
+
+  <!-- ===================== left token annotations ===================== -->
+  <line x1="126" y1="132" x2="140" y2="132" stroke="#94a3b8" stroke-width="1.2"/>
+  <rect x="14" y="116" width="112" height="32" rx="8" fill="#fff" stroke="#cbd5e1" stroke-width="1.2"/>
+  <text x="70" y="130" text-anchor="middle" font-size="11" font-weight="700" fill="#334155">2304 tokens</text>
+  <text x="70" y="143" text-anchor="middle" font-size="9" fill="#64748b">4 × 576 / window</text>
+
+  <line x1="126" y1="921" x2="140" y2="921" stroke="#94a3b8" stroke-width="1.2"/>
+  <rect x="14" y="903" width="112" height="36" rx="8" fill="#fff" stroke="#cbd5e1" stroke-width="1.2"/>
+  <text x="70" y="919" text-anchor="middle" font-size="11" font-weight="700" fill="#334155">576 tokens</text>
+  <text x="70" y="932" text-anchor="middle" font-size="9" fill="#16a34a">4× fewer (time only)</text>
+
+  <!-- ===================== right rail: temporal length ===================== -->
+  <text x="700" y="102" text-anchor="middle" font-size="10.5" font-weight="700" fill="#94a3b8" letter-spacing="0.5">TEMPORAL LENGTH</text>
+  <line x1="700" y1="170" x2="700" y2="792" stroke="#cbd5e1" stroke-width="1.4" stroke-dasharray="4 4" marker-end="url(#arrowlt)"/>
+
+  <!-- T=4 -->
+  <g>
+    <rect x="656" y="120" width="14" height="14" rx="2" fill="#fde68a" stroke="#f59e0b" stroke-width="1.1"/>
+    <rect x="674" y="120" width="14" height="14" rx="2" fill="#fde68a" stroke="#f59e0b" stroke-width="1.1"/>
+    <rect x="692" y="120" width="14" height="14" rx="2" fill="#fde68a" stroke="#f59e0b" stroke-width="1.1"/>
+    <rect x="710" y="120" width="14" height="14" rx="2" fill="#fde68a" stroke="#f59e0b" stroke-width="1.1"/>
+  </g>
+  <text x="690" y="152" text-anchor="middle" font-size="11" font-weight="600" fill="#475569">T = 4 frames</text>
+
+  <!-- T=2 (after stage 1 conv) -->
+  <g>
+    <rect x="676" y="479" width="14" height="14" rx="2" fill="#fcd34d" stroke="#f59e0b" stroke-width="1.1"/>
+    <rect x="694" y="479" width="14" height="14" rx="2" fill="#fcd34d" stroke="#f59e0b" stroke-width="1.1"/>
+  </g>
+  <text x="692" y="510" text-anchor="middle" font-size="11" font-weight="600" fill="#475569">T = 2 frames</text>
+
+  <!-- T=1 (after stage 2 conv) -->
+  <rect x="683" y="795" width="14" height="14" rx="2" fill="#fbbf24" stroke="#f59e0b" stroke-width="1.1"/>
+  <text x="690" y="827" text-anchor="middle" font-size="11" font-weight="600" fill="#475569">T = 1 frame</text>
+
+  <!-- ===================== legend ===================== -->
+  <line x1="120" y1="978" x2="740" y2="978" stroke="#e2e8f0" stroke-width="1.2"/>
+  <text x="120" y="1000" font-size="12" font-weight="700" fill="#64748b" letter-spacing="0.5">LEGEND</text>
+
+  <rect x="150" y="1018" width="14" height="14" rx="3" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.2"/>
+  <text x="172" y="1030" font-size="11.5" fill="#334155">Spatial attention (AttnBlock3D)</text>
+
+  <rect x="150" y="1048" width="14" height="14" rx="3" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1.2"/>
+  <text x="172" y="1060" font-size="11.5" fill="#334155">Temporal attention (relative-pos, zero-init)</text>
+
+  <rect x="440" y="1018" width="14" height="14" rx="3" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.2"/>
+  <text x="462" y="1030" font-size="11.5" fill="#334155">Temporal downsample conv (stride 2)</text>
+
+  <rect x="440" y="1048" width="14" height="14" rx="3" fill="#d1fae5" stroke="#10b981" stroke-width="1.2"/>
+  <text x="462" y="1060" font-size="11.5" fill="#334155">Learnable temporal position add</text>
+</svg>

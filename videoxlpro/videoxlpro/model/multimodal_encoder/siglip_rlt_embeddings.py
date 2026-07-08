@@ -18,9 +18,8 @@ Pipeline (one clip of T frames):
         |  SigLIP embeddings  -> (T, P, C)   spatial pos already baked in
         |  RLT keep-mask      -> drop temporally-redundant patch tokens
         v
-    gather survivors (N, C)            # N <= T*P, in (t,h,w) order
-        + temporal position[frame_t]   # NEW: SigLIP has no temporal axis
-        + length embedding[run_len-1]  # NEW: how many frames the token spans
+    gather survivors (N, C)               # N <= T*P, in (t,h,w) order
+        + temporal position[frame_t]*s     # fixed sinusoid, scaled to SigLIP pos RMS
         |
         |  pack -> (1, N, C),  BlockDiagonalMask.from_seqlens([N])
         v
@@ -28,9 +27,13 @@ Pipeline (one clip of T frames):
 
 What it deliberately ADDS on top of SigLIP (because SigLIP is per-image, RLT is
 per-clip):
-  * a temporal position table (sinusoidal over frames),
-  * a LEARNABLE run-length encoding phi_L (paper sec 3.2), trained during
-    fine-tuning; owned by the base model so it reaches the optimizer/checkpoint,
+  * a FIXED temporal position table (sinusoidal over frames). SigLIP already bakes
+    in SPATIAL position, so RLT adds only the temporal component -- scaled to the
+    magnitude of SigLIP's own position_embedding, so it enters exactly as SigLIP's
+    spatial position does (a raw unit sinusoid would vanish against the feature
+    magnitude; the whole-feature RMS would be too large). This is the ONLY thing RLT
+    adds at the seam: the paper reports the learnable run-length encoding
+    contributes little, so it is not used here.
   * cross-frame attention over the packed survivors (RLT-faithful: one block per
     clip via BlockDiagonalMask).
 
@@ -39,7 +42,7 @@ NOTE (downstream): the output is a *ragged* (N, C) token set, not the dense
 SAE -> 2D pool) expects. Wiring this into llava_arch is a separate step.
 """
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -49,42 +52,13 @@ from xformers.ops.fmha.attn_bias import BlockDiagonalMask
 try:
     from .rlt_static_tokens import (
         batched_find_idxs_to_keep,
-        batched_get_token_lengths,
         get_sinusoid_encoding,
     )
 except ImportError:  # allow running this file directly as a script for testing
     from rlt_static_tokens import (
         batched_find_idxs_to_keep,
-        batched_get_token_lengths,
         get_sinusoid_encoding,
     )
-
-
-def get_token_lengths_aligned(token_mask: torch.Tensor, T: int, h: int, w: int) -> torch.Tensor:
-    """Run-length per surviving token, in (t, h, w) order to match the gather.
-
-    Same run-length *values* as rlt_static_tokens.batched_get_token_lengths, but
-    returned in (t, h, w) order so they line up with survivors gathered by
-    `tokens.flatten[token_mask]`. (The reference returns them in (h, w, t) order;
-    see the ordering caveat in rlt_static_tokens.py.)
-
-    Built as a dense length-map then gathered with the same mask, so alignment is
-    guaranteed by construction.
-    """
-    dev = token_mask.device
-    m = token_mask.reshape(1, T, h, w)
-    t_idx = torch.arange(T, device=dev).view(1, T, 1, 1).expand(1, T, h, w)
-    big = T
-
-    kept_idx = torch.where(m, t_idx, torch.full_like(t_idx, big))
-    # nearest kept frame index at >= t (reverse cumulative min along time)
-    next_incl = torch.flip(torch.cummin(torch.flip(kept_idx, dims=[1]), dim=1).values, dims=[1])
-    # nearest kept frame strictly after t; pad tail with `big` to close last run
-    tail = torch.full((1, 1, h, w), big, device=dev, dtype=next_incl.dtype)
-    next_after = torch.cat([next_incl[:, 1:], tail], dim=1)
-
-    length_map = torch.where(m, (next_after - t_idx).clamp(min=1), torch.zeros_like(t_idx))
-    return length_map.flatten()[token_mask.flatten()]   # (N,), (t,h,w) order
 
 
 class SiglipRLTEmbeddings(nn.Module):
@@ -97,13 +71,11 @@ class SiglipRLTEmbeddings(nn.Module):
             normalized SigLIP input range.
         patch_size: SigLIP patch size (14 for siglip-so400m-patch14-384).
         max_frames: size of the temporal position table.
-        use_length_embed: add the run-length embedding (RLT's length encoding).
-        length_embed: optional model-owned learnable run-length encoding phi_L,
-            passed as an nn.Embedding (paper sec 3.2). When given, this wrapper
-            references that module (so it stays in the base model's
-            named_parameters() -> optimizer + checkpoint, and DeepSpeed Zero-3
-            gathers it via the module's forward hook); when None, it creates its own
-            zero-init embedding for standalone / eval use.
+        temporal_pos_scale: multiplier on the temporal-position magnitude AFTER it
+            is rescaled to the RMS of SigLIP's own position_embedding. 1.0 => temporal
+            position enters at the same magnitude SigLIP uses for spatial position;
+            <1.0 => a gentler complement; 0 => disabled. This is the only RLT-specific
+            knob; RLT adds no learnable state at the seam.
     """
 
     def __init__(
@@ -112,9 +84,8 @@ class SiglipRLTEmbeddings(nn.Module):
         threshold: float = 0.1,
         patch_size: int = 14,
         max_frames: int = 512,
-        use_length_embed: bool = True,
+        temporal_pos_scale: float = 1.0,
         apply_post_layernorm: bool = False,
-        length_embed: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         self.vision_model = vision_model
@@ -127,7 +98,7 @@ class SiglipRLTEmbeddings(nn.Module):
         self.threshold = threshold
         self.patch_size = patch_size
         self.max_frames = max_frames
-        self.use_length_embed = use_length_embed
+        self.temporal_pos_scale = temporal_pos_scale
         # Video-XL-Pro consumes SigLIP's hidden_states[-1] (the last encoder layer
         # output, BEFORE post_layernorm). Default off to match that; the projector
         # was trained on pre-LN features.
@@ -142,23 +113,9 @@ class SiglipRLTEmbeddings(nn.Module):
             persistent=False,
         )
 
-        # Run-length encoding phi_L (paper "Don't Look Twice", sec 3.2): a LEARNABLE
-        # per-length bias the model trains during fine-tuning to compensate for the
-        # info removed by temporal pruning. (The original frozen sinusoid disabled
-        # exactly the mechanism the paper relies on.) Implemented as an nn.Embedding
-        # so it is consumed via a module forward -- DeepSpeed Zero-3 gathers and
-        # reduce-scatters its weight through the standard forward hook.
-        #   * length_embed passed in -> reference the model-owned module. Stash it in
-        #     __dict__ so this (un-registered) wrapper's .to()/.cuda() can't clone it
-        #     and silently break sharing; gradients still flow to it.
-        #   * length_embed is None   -> own zero-init embedding (standalone/eval). Zero
-        #     init => no-op at the seam initially, so enabling RLT does not shock the
-        #     pretrained features; fine-tuning learns the bias from zero.
-        if length_embed is not None:
-            self.__dict__["length_embed"] = length_embed
-        else:
-            self.length_embed = nn.Embedding(max_frames, self.embed_dim)
-            nn.init.zeros_(self.length_embed.weight)
+        # NOTE: the paper's learnable run-length encoding phi_L is deliberately NOT
+        # used -- the paper reports it contributes little, and RLT here adds only the
+        # scale-matched fixed temporal position above. No trainable state at the seam.
 
     def _xformers_attention(self, self_attn, x: torch.Tensor, attn_bias) -> torch.Tensor:
         """SigLIP attention via xformers block-diagonal memory_efficient_attention.
@@ -194,14 +151,14 @@ class SiglipRLTEmbeddings(nn.Module):
             x = self.post_layernorm(x)
         return x
 
-    def forward(self, pixel_values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, pixel_values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        NOTE: deliberately NOT wrapped in @torch.no_grad(). The paper propagates
-        gradients to the learnable run-length encoding phi_L during fine-tuning, so
-        the encoder graph must be retained when training. What actually updates is
-        controlled by requires_grad (the SigLIP backbone stays frozen; only phi_L
-        and downstream modules train). At eval, the caller's inference_mode/no_grad
-        keeps this cheap.
+        NOTE: deliberately NOT wrapped in @torch.no_grad(), so gradients can reach
+        downstream modules during fine-tuning. The added temporal position is a FIXED
+        sinusoid rescaled by a DETACHED per-clip factor, so RLT introduces no trainable
+        state of its own at the seam. What actually updates is controlled by
+        requires_grad (the SigLIP backbone stays frozen). At eval, the caller's
+        inference_mode/no_grad keeps this cheap.
 
         Args:
             pixel_values: (T, 3, H, W) frames for ONE clip.
@@ -209,7 +166,6 @@ class SiglipRLTEmbeddings(nn.Module):
         Returns:
             survivors: (N, C) encoded surviving tokens.
             token_mask: (T*P,) bool keep-mask in (t,h,w) order.
-            lengths: (N,) run-length per surviving token (t,h,w order).
         """
         T = pixel_values.shape[0]
         dev, dtype = pixel_values.device, pixel_values.dtype
@@ -234,22 +190,27 @@ class SiglipRLTEmbeddings(nn.Module):
         mask_flat = token_mask.reshape(-1)                            # (T*P,)
         survivors = emb.reshape(T * P, self.embed_dim)[mask_flat]     # (N, C)
 
-        # 4. Add temporal position phi_t: per-survivor frame index. The buffer is
-        #    placed on-device here (no blanket module .to() at build time), then
-        #    indexed -- index and table must share a device.
+        # 4. Add a FIXED temporal position phi_t (which frame each survivor came from).
+        #    SigLIP already provides SPATIAL position (baked into `emb`), so we add only
+        #    the temporal component the paper's spatiotemporal encoding contributes on
+        #    top. It is scaled to the magnitude SigLIP itself uses for position -- the
+        #    RMS of SigLIP's own position_embedding.weight -- so temporal position
+        #    enters exactly as SigLIP's spatial position does (faithful in spirit to the
+        #    RLT paper, which adds position at the backbone's own position scale), rather
+        #    than as a raw unit sinusoid (would vanish) or the whole-feature RMS (too
+        #    large). The scale is DETACHED (it only rescales the frozen sinusoid).
         frame_idx = torch.arange(T, device=dev).view(T, 1).expand(T, P).reshape(-1)[mask_flat]
-        temporal_pos = self.temporal_pos.to(device=dev, dtype=dtype)
-        survivors = survivors + temporal_pos[frame_idx]
+        pos = self.temporal_pos.to(device=dev, dtype=dtype)[frame_idx]   # (N, C)
+        if self.temporal_pos_scale > 0 and survivors.numel() > 0:
+            # Read SigLIP's spatial position encoding via the module forward (as HF
+            # does) rather than .weight directly, so under DeepSpeed Zero-3 the sharded
+            # weight is gathered by the nn.Embedding forward hook.
+            sp = self.embeddings.position_embedding(self.embeddings.position_ids)  # (1, P, C)
+            ref_rms = sp.detach().float().pow(2).mean().sqrt()
+            pos_rms = pos.detach().float().pow(2).mean().sqrt().clamp_min(1e-6)
+            survivors = survivors + pos * (self.temporal_pos_scale * ref_rms / pos_rms).to(dtype)
 
-        # 5. Add learnable run-length encoding phi_L: run-length per survivor
-        #    (aligned order). length_embed is the model-owned nn.Embedding; calling
-        #    it (vs indexing) lets Zero-3 gather its weight, and the cast keeps
-        #    autograd flowing back to it.
-        lengths = get_token_lengths_aligned(mask_flat, T, h, w)       # (N,), in [1,T]
-        if self.use_length_embed:
-            survivors = survivors + self.length_embed(lengths - 1).to(device=dev, dtype=dtype)
-
-        # 6. Pack and encode with PER-FRAME attention. SigLIP is a 2D image encoder
+        # 5. Pack and encode with PER-FRAME attention. SigLIP is a 2D image encoder
         #    (weights trained with WITHIN-frame attention), and Video-XL-Pro already
         #    defers whole-video attention to the LLM. So each frame's survivors
         #    attend only within that frame (per-frame block-diagonal = 2D /
@@ -261,7 +222,7 @@ class SiglipRLTEmbeddings(nn.Module):
         x = survivors.unsqueeze(0)                                    # (1, N, C)
         x = self._run_encoder(x, attn_bias).squeeze(0)               # (N, C)
 
-        return x, mask_flat, lengths
+        return x, mask_flat
 
 
 if __name__ == "__main__":
@@ -291,17 +252,10 @@ if __name__ == "__main__":
     frames = base.repeat(T, 1, 1, 1)
     frames[3:, :, :patch, :patch] += 5.0
 
-    survivors, mask_flat, lengths = rlt(frames)
+    survivors, mask_flat = rlt(frames)
     N = int(mask_flat.sum())
     print(f"survivors: {tuple(survivors.shape)}  (N={N}, dense would be {T*P})")
-    print(f"lengths (t,h,w order): {lengths.tolist()}")
-    print(f"sum lengths: {int(lengths.sum())} (== T*P = {T*P})")
-
-    # cross-check: aligned length multiset == faithful reference multiset
-    ref = batched_get_token_lengths(mask_flat.unsqueeze(0).cpu(), batch_size=1, input_shape=(T, h, w))
-    assert sorted(lengths.cpu().tolist()) == sorted(ref.tolist()), "length multiset must match reference"
 
     assert survivors.shape == (N, cfg.hidden_size)
-    assert int(lengths.sum()) == T * P
     assert torch.isfinite(survivors.float()).all(), "non-finite outputs from xformers attention"
     print("\nOK: SigLIP-RLT embeddings run end-to-end through xformers attention.")

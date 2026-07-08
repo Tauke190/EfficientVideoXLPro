@@ -49,22 +49,16 @@ class LlavaMetaModel:
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
 
-            if getattr(config, "use_rlt", False):
-                # Create the learnable run-length encoding phi_L here so trained-RLT
-                # checkpoints load their weight into it, and (under DeepSpeed Zero-3)
-                # it is partitioned by the surrounding zero.Init context. Idempotent.
-                self.get_rlt_length_embed()
-
             if getattr(config, "use_apt_temporal", False):
-                # Same reasoning as RLT's phi_L above, for APT-Temporal's own
-                # run-length embedding (a separate table from RLT's, so the two
-                # modes -- mutually exclusive -- each get their own trained bias).
+                # APT-Temporal's own learnable run-length embedding. Owned by the base
+                # model (not the unregistered APT wrapper) so trained checkpoints load
+                # its weight and DeepSpeed Zero-3 gathers it via its forward.
                 self.get_apt_temporal_reuse_embed()
 
             if getattr(config, "use_apt", False):
-                # Same reasoning as RLT's phi_L above: own patch_attn/zero_conv
-                # here (not inside the unregistered APT wrapper) so trained-APT
-                # checkpoints load their weights and DeepSpeed Zero-3 gathers them.
+                # APT's trainable patch_attn/zero_conv, owned here (not inside the
+                # unregistered APT wrapper) so trained-APT checkpoints load their
+                # weights and DeepSpeed Zero-3 gathers them.
                 self.get_apt_patch_attn()
                 self.get_apt_zero_conv()
 
@@ -102,31 +96,13 @@ class LlavaMetaModel:
             vision_tower = vision_tower[0]
         return vision_tower
 
-    def get_rlt_length_embed(self):
-        """Learnable run-length encoding phi_L (paper "Don't Look Twice", sec 3.2).
-
-        Owned by the base model (not the RLT wrapper, which is kept out of the module
-        registry) so it appears in named_parameters() -> optimizer + checkpoint, and
-        is consumed via its forward so DeepSpeed Zero-3 gathers it. The RLT wrapper
-        references this same nn.Embedding, so gradients land here. Zero-init: enabling
-        RLT is a no-op at the seam until fine-tuning learns the per-length bias. Sized
-        to the SigLIP encoder width where phi_L is added.
-        """
-        if getattr(self, "rlt_length_embed", None) is None:
-            vt = self.get_vision_tower()
-            dim = getattr(vt, "hidden_size", None) or self.config.mm_hidden_size
-            max_frames = getattr(self.config, "rlt_max_frames", 512)
-            emb = nn.Embedding(max_frames, dim)
-            nn.init.zeros_(emb.weight)
-            self.rlt_length_embed = emb.to(device=vt.device, dtype=vt.dtype)
-        return self.rlt_length_embed
-
     def get_apt_temporal_reuse_embed(self):
-        """Learnable run-length embedding for APT-Temporal, exact same ownership
-        pattern as get_rlt_length_embed() above (own table, since use_rlt and
-        use_apt_temporal are mutually exclusive modes measured independently).
+        """Learnable run-length embedding for APT-Temporal. Owned by the base model
+        (not the unregistered APT wrapper) so it appears in named_parameters() ->
+        optimizer + checkpoint and DeepSpeed Zero-3 gathers it via its forward.
         Zero-init: enabling APT-Temporal's collapsing is a no-op bias at the
-        seam until fine-tuning learns the per-run-length bias.
+        seam until fine-tuning learns the per-run-length bias. (Unlike RLT, which
+        adds no learnable state, APT-Temporal does train this table.)
         """
         if getattr(self, "apt_temporal_reuse_embed", None) is None:
             vt = self.get_vision_tower()
@@ -385,12 +361,11 @@ class LlavaMetaForCausalLM(ABC):
                 threshold=getattr(self.config, "rlt_threshold", 0.3),
                 patch_size=getattr(self.config, "rlt_patch_size", 14),
                 max_frames=getattr(self.config, "rlt_max_frames", 512),
-                length_embed=self.get_model().get_rlt_length_embed(),
+                temporal_pos_scale=getattr(self.config, "rlt_temporal_pos_scale", 1.0),
             )
             # NB: no blanket .to(device/dtype) here. The module aliases the
-            # already-placed vision tower and the model-owned length_embed; a blanket
-            # .to would clone the latter and break sharing with the optimizer /
-            # checkpoint. temporal_pos is placed on-device inside forward().
+            # already-placed vision tower; temporal_pos is placed on-device inside
+            # forward(). RLT adds no learnable state of its own.
             self.__dict__["_rlt_module"] = rlt
         return rlt
 
@@ -407,7 +382,7 @@ class LlavaMetaForCausalLM(ABC):
         features = []
         total_keep = total_dense = 0
         for i, frames in enumerate(per_clip_frames):
-            survivors, mask_flat, _ = rlt(frames)                  # (N, mm_hidden)
+            survivors, mask_flat = rlt(frames)                     # (N, mm_hidden)
             n_keep, n_dense = int(mask_flat.sum()), int(mask_flat.numel())
             total_keep += n_keep
             total_dense += n_dense
@@ -477,7 +452,7 @@ class LlavaMetaForCausalLM(ABC):
         total_keep = total_dense = 0
         for i, frames in enumerate(per_clip_frames):
             T = frames.shape[0]
-            survivors, mask_flat, _ = rlt(frames)                          # (N, C), (T*P,)
+            survivors, mask_flat = rlt(frames)                             # (N, C), (T*P,)
             P = mask_flat.numel() // T
             n_keep, n_dense = int(mask_flat.sum()), int(mask_flat.numel())
             total_keep += n_keep
@@ -495,9 +470,8 @@ class LlavaMetaForCausalLM(ABC):
         Stored via __dict__ (not nn.Module's registry) so it does not re-register
         the shared vision tower as a duplicate submodule. patch_attn/zero_conv are
         passed in from the base model's own get_apt_patch_attn()/get_apt_zero_conv()
-        (same reasoning as RLT's length_embed injection above) so they land in
-        named_parameters() -> optimizer + checkpoint instead of being orphaned
-        inside this unregistered wrapper.
+        so they land in named_parameters() -> optimizer + checkpoint instead of being
+        orphaned inside this unregistered wrapper.
         """
         apt = self.__dict__.get("_apt_module", None)
         if apt is None:

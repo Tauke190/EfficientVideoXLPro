@@ -11,8 +11,8 @@ export CUDA_VISIBLE_DEVICES=0,2
 # --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,use_rlt=True,rlt_threshold=0.2 \
 # --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt=True,apt_threshold=4.0:6.0,apt_num_scales=3 \
 # --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,use_rlt=True,rlt_threshold=0.2 \
-# --model_args pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-finetune-llava665k,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=False,use_rlt=True,rlt_threshold=0.3 \
-# --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True \
+# --model_args pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-finetune-llava665k-without-DTS,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=False \
+# --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=False \
 
 # use_apt_temporal
 LOG_DIR="./logs/videoxlpro_mlvu"
@@ -23,8 +23,9 @@ accelerate launch --num_processes=2 --main_process_port 12345 \
     -m lmms_eval \
     --model videoxlpro \
     --tasks mlvu_test \
-    --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=False \
+    --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,rlt_threshold=0.05 \
     --batch_size 1 \
+    --limit 100 \
     --log_samples \
     --log_samples_suffix videoxlpro_mlvu \
     --output_path "$LOG_DIR" \
@@ -40,6 +41,7 @@ echo "========================================"
 # 100 - 8.74 
 # 200 - 
 # All -
+
 
 # Num of sample at 32 frames with SAE - Accuracy MLVU Test
 # 100 - 13.98

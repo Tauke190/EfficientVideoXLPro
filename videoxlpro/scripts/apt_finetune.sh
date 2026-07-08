@@ -52,7 +52,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --save_strategy "steps" \
     --save_steps 3000 \
     --save_total_limit 2 \
-    --learning_rate 1e-6 \
+    --learning_rate 2e-5 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \

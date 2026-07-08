@@ -115,6 +115,7 @@ class ModelArguments:
     rlt_threshold: float = field(default=0.3, metadata={"help": "Mean abs pixel-change threshold for dropping temporally-redundant tokens."})
     rlt_max_frames: int = field(default=512)
     rlt_patch_size: int = field(default=14)
+    rlt_temporal_pos_scale: float = field(default=1.0, metadata={"help": "Magnitude of the fixed temporal-position sinusoid added to survivors, as a multiple of the per-clip SigLIP feature RMS (1.0 = same scale as the features; 0 disables). RLT adds only this scale-matched temporal position -- no learnable state at the seam."})
 
     # Adaptive Patch Transformer (APT) at the SigLIP embedding seam -- per-frame
     # spatial quadtree merge. These fields previously had no CLI/dataclass home
@@ -306,11 +307,9 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         keys_to_match = ["mm_projector", "vision_resampler"]
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
-        # RLT's learnable phi_L lives on the base model (not the projector/resampler),
-        # so include it here or an adapter-only save would silently drop it.
-        if getattr(trainer.model.config, "use_rlt", False):
-            keys_to_match.append("rlt_length_embed")
-        # Same reasoning for APT-Temporal's own run-length embedding.
+        # RLT has no learnable state of its own (only a fixed, scale-matched temporal
+        # position sinusoid), so there is nothing RLT-specific to add here.
+        # APT-Temporal's own run-length embedding still needs including, though.
         if getattr(trainer.model.config, "use_apt_temporal", False):
             keys_to_match.append("apt_temporal_reuse_embed")
         # Same reasoning for APT's patch_attn/zero_conv.
@@ -1541,18 +1540,78 @@ class StepLoggingCallback(transformers.TrainerCallback):
             rank0_print(f"[step={state.global_step}] {logs}")
 
 
-class RLTLengthEmbedDebugCallback(transformers.TrainerCallback):
-    """Every `every_n_steps`, prints the per-run-length mean abs weight of phi_L
-    (rlt_length_embed). Zero-init, so a cheap way to see whether it's actually
-    receiving gradient signal without waiting on a full lmms-eval pass."""
+class AptModuleNormCallback(transformers.TrainerCallback):
+    """When APT / APT-Temporal is on, log the L2 weight norm -- and the L2
+    distance travelled from the initial weights -- of the ONLY trainable modules,
+    to wandb + stdout every logging step.
 
-    def __init__(self, every_n_steps: int = 1000):
-        self.every_n_steps = every_n_steps
+    Why weight norm rather than grad norm: apt_zero_conv is zero-initialized in
+    weight AND bias (LlavaMetaModel.get_apt_zero_conv), so its weight norm is
+    EXACTLY 0 at step 0 and can only grow if training actually moves it -- the
+    cleanest proof the merge compensation (paper arXiv 2510.18091 Eq. 2) is being
+    learned rather than merely receiving gradients. `wdelta_from_init` makes the
+    same point for patch_attn, whose default (non-zero) init means a shrinking or
+    merely-rotating weight would otherwise be ambiguous. (Per-module grad norms
+    would need a pre-optimizer-step hook that transformers 4.45 lacks; the global
+    `train/grad_norm` the Trainer already logs equals the APT grad norm here
+    anyway, since these are the only trainable params.)
 
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if state.global_step % self.every_n_steps == 0 and args.local_rank in (-1, 0):
-            phi_L = model.get_model().rlt_length_embed
-            rank0_print(f"[RLT] step={state.global_step} phi_L per-length mean(|weight|)={phi_L.weight.abs().mean(dim=-1)}")
+    Targets (matched by name substring): apt_patch_attn / apt_zero_conv (plain
+    APT) and apt_temporal_reuse_embed (APT-Temporal). Under DeepSpeed Zero-3 these
+    params are sharded, so every read is gathered via GatheredParameters -- a
+    collective, so ALL ranks run the gather (in the same param order) and only
+    rank 0 records/logs; guarding the gather behind a rank check would deadlock.
+    """
+
+    _KEYS = ("apt_patch_attn", "apt_zero_conv", "apt_temporal_reuse_embed")
+
+    def __init__(self, model):
+        self._model = model
+        self._init_flat = {}   # name -> initial gathered weights (CPU fp32)
+
+    def _targets(self):
+        # Deterministic order across ranks (named_parameters order is stable).
+        return [(n, p) for n, p in self._model.named_parameters()
+                if any(k in n for k in self._KEYS)]
+
+    @staticmethod
+    def _gathered(param):
+        """CPU fp32 copy of the (Zero-3-gathered) full parameter. Collective under
+        Zero-3 -- every rank must call it."""
+        import contextlib
+        ctx = contextlib.nullcontext()
+        if hasattr(param, "ds_id"):
+            import deepspeed
+            ctx = deepspeed.zero.GatheredParameters([param], modifier_rank=None)
+        with ctx:
+            return param.detach().float().cpu().reshape(-1).clone()
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        for name, param in self._targets():
+            flat = self._gathered(param)               # collective: all ranks participate
+            if args.local_rank in (-1, 0):
+                self._init_flat[name] = flat
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        metrics = {}
+        for name, param in self._targets():
+            cur = self._gathered(param)                # collective: all ranks participate
+            if args.local_rank not in (-1, 0):
+                continue
+            short = "_".join(name.split(".")[-2:])     # e.g. apt_zero_conv_weight
+            metrics[f"apt/{short}_wnorm"] = float(cur.norm())
+            init = self._init_flat.get(name)
+            if init is not None and init.numel() == cur.numel():
+                metrics[f"apt/{short}_wdelta_from_init"] = float((cur - init).norm())
+        if args.local_rank not in (-1, 0) or not metrics:
+            return
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.log(metrics, step=state.global_step)
+        except Exception:
+            pass
+        rank0_print(f"[step={state.global_step}] APT-module norms: {metrics}")
 
 
 def train(attn_implementation=None):
@@ -1726,6 +1785,7 @@ def train(attn_implementation=None):
         model.config.rlt_threshold = model_args.rlt_threshold
         model.config.rlt_max_frames = model_args.rlt_max_frames
         model.config.rlt_patch_size = model_args.rlt_patch_size
+        model.config.rlt_temporal_pos_scale = model_args.rlt_temporal_pos_scale
 
         # APT config -> model.config (patch_attn/zero_conv trainability is handled
         # below, same as RLT's phi_L; see the ModelArguments field comments).
@@ -1803,14 +1863,10 @@ def train(attn_implementation=None):
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
                         param.requires_grad_(True)
 
-        # RLT: phi_L (run-length encoding) is a learnable parameter trained during
-        # fine-tuning (paper sec 3.2). Create + register it on the base model NOW --
-        # before the optimizer / DeepSpeed engine is built -- and keep it trainable
-        # whenever RLT is enabled, regardless of which other parts are tunable.
-        if getattr(model.config, "use_rlt", False):
-            phi_L = model.get_model().get_rlt_length_embed()
-            phi_L.requires_grad_(True)
-            rank0_print(f"[RLT] learnable run-length encoding phi_L registered (shape={tuple(phi_L.weight.shape)}) and unfrozen.")
+        # RLT adds no learnable state at the seam: it only adds a FIXED, scale-matched
+        # temporal position sinusoid (the paper's learnable run-length encoding is not
+        # used, as it contributes little). So there is nothing RLT-specific to unfreeze
+        # here -- which parts train is governed entirely by mm_tunable_parts.
 
         # APT: patch_attn (Conv2d^i) and zero_conv (ZeroMLP) are the trainable
         # compensation for the quadtree merge (paper arXiv 2510.18091 Eq. 2). Same
@@ -1879,8 +1935,12 @@ def train(attn_implementation=None):
 
     trainer.add_callback(StepLoggingCallback())
 
-    if getattr(model.config, "use_rlt", False):
-        trainer.add_callback(RLTLengthEmbedDebugCallback(every_n_steps=1000))
+    # APT / APT-Temporal train only a couple of tiny modules; log their weight
+    # norms (apt_zero_conv starts at exactly 0) so wandb shows them moving.
+    if getattr(model.config, "use_apt", False) or getattr(model.config, "use_apt_temporal", False):
+        trainer.add_callback(AptModuleNormCallback(model))
+        rank0_print("[APT] AptModuleNormCallback registered: logging apt/*_wnorm + apt/*_wdelta_from_init to wandb.")
+
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

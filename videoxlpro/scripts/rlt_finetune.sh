@@ -17,6 +17,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     videoxlpro/train/train_mem.py \
     --deepspeed scripts/zero3.json \
     --use_rlt True \
+    --rlt_temporal_pos_scale 1.0 \
     --model_name_or_path ${MODEL_PATH} \
     --version ${PROMPT_VERSION} \
     --data_path /home/av354855/EfficientVideoXLPro/data_mix.yaml \

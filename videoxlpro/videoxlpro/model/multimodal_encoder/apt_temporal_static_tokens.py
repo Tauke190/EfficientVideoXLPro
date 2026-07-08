@@ -237,9 +237,9 @@ def compute_origin_index(event_mask: torch.Tensor) -> torch.Tensor:
 
 def compute_run_lengths(is_new_token: torch.Tensor) -> torch.Tensor:
     """(T,G,G) bool -> (T,G,G) long: run-length assigned at each new-token
-    event (0 at non-event positions). Mirrors
-    siglip_rlt_embeddings.get_token_lengths_aligned's cummin/flip trick,
-    applied along dim 0 (T) instead of a flattened (t,h,w) index.
+    event (0 at non-event positions). Uses a reverse-cummin/flip trick along
+    dim 0 (T): the run-length of a new-token event at frame t is the distance to
+    the next new-token event after t.
     """
     T = is_new_token.shape[0]
     dev = is_new_token.device
