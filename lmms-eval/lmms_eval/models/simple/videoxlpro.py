@@ -40,6 +40,7 @@ class VideoXLPro(lmms):
         use_sae: Optional[bool] = True,
         use_rlt: Optional[bool] = False,
         rlt_threshold: Optional[float] = 0.1,
+        rlt_temporal_pos_scale: Optional[float] = 0.0,
         use_apt: Optional[bool] = False,
         apt_threshold: Optional[float] = 4.0,
         apt_thresholds: Optional[str] = None,
@@ -91,6 +92,11 @@ class VideoXLPro(lmms):
         self._model.config.use_sae = use_sae
         self._model.config.use_rlt = use_rlt
         self._model.config.rlt_threshold = rlt_threshold
+        # How loud the fixed temporal-position sinusoid RLT adds to survivors is.
+        # Composed path (use_sae=True): keep 0.0 -- the SAE already supplies temporal
+        # info, so the extra sinusoid only perturbs it. Ragged path (use_sae=False):
+        # set >0 (e.g. 1.0) since nothing else provides temporal order.
+        self._model.config.rlt_temporal_pos_scale = rlt_temporal_pos_scale
         # APT (spatial adaptive patches) and APT-Temporal (APT + temporal
         # redundancy collapsing on top) -- mutually exclusive with use_rlt
         # and with each other, so each method's gain is measured independently.

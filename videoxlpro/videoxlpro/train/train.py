@@ -62,7 +62,7 @@ class ModelArguments:
     model_class_name: Optional[str] = field(default=None, metadata={"help": "Used to init model class, format is XXXXForCausalLM. e.g. currently XXXX is chosen from LlavaLlama, LlavaMixtral, LlavaMistral, Llama"})
 
     mm_tunable_parts: Optional[str] = field(
-        default=None, metadata={"help": 'Could be "mm_mlp_adapter", "mm_vision_resampler", "mm_vision_tower,mm_mlp_adapter,mm_language_model", "mm_vision_tower,mm_mlp_adapter,mm_language_model", "mm_mlp_adapter,mm_language_model"'}
+        default=None, metadata={"help": 'Could be "mm_mlp_adapter", "mm_vision_resampler", "mm_vision_tower,mm_mlp_adapter,mm_language_model", "mm_vision_tower,mm_mlp_adapter,mm_language_model", "mm_mlp_adapter,mm_language_model". Also "mm_temporal_compressor" to train only the SAE/text_mlp/WindowTimeToTokenAttention stack (LLM frozen).'}
     )
     # deciding which part of the multimodal model to tune, will overwrite other previous settings
 
@@ -1883,6 +1883,13 @@ def train(attn_implementation=None):
             if "mm_language_model" in tunable_parts:
                 for name, param in model.named_parameters():
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
+                        param.requires_grad_(True)
+            # Temporal-compression stack ONLY (SAE + text_mlp + WindowTimeToTokenAttention),
+            # leaving the LLM frozen. Use this instead of "mm_language_model" to re-align the
+            # visual pathway to RLT-perturbed features without touching the LLM's VQA ability.
+            if "mm_temporal_compressor" in tunable_parts:
+                for name, param in model.named_parameters():
+                    if any(k in name for k in ("sae", "text_mlp", "WindowTimeToTokenAttention")):
                         param.requires_grad_(True)
 
         # RLT adds no learnable state at the seam: it only adds a FIXED, scale-matched
