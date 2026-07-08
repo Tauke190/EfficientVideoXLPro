@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=videoxlpro
-#SBATCH --output=/home/av354855/EfficientVideoXLPro/slurmlogs/videoxlpro-%j.out
+#SBATCH --output=/home/av354855/EfficientVideoXLPro/slurmlogs/apt_videoxlpro-%j.out
 #SBATCH --gres-flags=enforce-binding
 #SBATCH -p gpu
 #SBATCH -C gmem80
@@ -53,15 +53,17 @@ export ADDR=localhost
 # Bypass DeepSpeed's strict CUDA version-string check; safe because the loaded toolkit (12.x)
 # matches torch's CUDA major version (cu121). Needed for the cpu_adam JIT build under offload.
 export DS_SKIP_CUDA_CHECK=1
-# Reduce CUDA allocator fragmentation (the original OOM had >1GB reserved-but-unallocated).
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# /mnt/SSD2/huggingface/hub/models--MINT-SJTU--Video-XL-Pro-3B/snapshots/d9914fb2249a9de39daac33a3e02a34a991524db
+
+export WANDB_PROJECT="videoxlpro-apt"
+export WANDB_ENTITY="ag8093-university-of-central-florida"
+export WANDB_DIR="/home/av354855/EfficientVideoXLPro/videoxlpro"
+
 MODEL_PATH="MINT-SJTU/Video-XL-Pro-3B"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
 PROMPT_VERSION=qwen_1_5
-MID_RUN_NAME="videoxlpro-3b-apt-only-llava&ego4D"
+MID_RUN_NAME="videoxlpro-3b-apt-llava&ego4D"
 
 echo "Fine-tuning run: ${MID_RUN_NAME}"
 
