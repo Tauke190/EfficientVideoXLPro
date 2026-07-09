@@ -5,7 +5,7 @@ export ADDR=localhost
 export PORT=12345
 
 # Starting from the pre-trained Video-XL-Pro-3B checkpoint (skips pretrain stage)
-MODEL_PATH="/mnt/SSD2/huggingface/hub/models--MINT-SJTU--Video-XL-Pro-3B/snapshots/d9914fb2249a9de39daac33a3e02a34a991524db"
+MODEL_PATH="MINT-SJTU/Video-XL-Pro-3B"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
 PROMPT_VERSION=qwen_1_5
@@ -18,16 +18,18 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --deepspeed scripts/zero3.json \
     --model_name_or_path ${MODEL_PATH} \
     --version ${PROMPT_VERSION} \
-    --data_path /mnt/SSD2/LLaVA-Finetune/llava_v1_5_mix665k_with_video_chatgpt_pretty.json \
-    --image_folder /mnt/SSD2/LLaVA-Finetune \
-    --video_folder /mnt/SSD2/LLaVA-Finetune \
-    --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_language_model" \
+    --data_path /home/av354855/EfficientVideoXLPro/data_mix.yaml \
+    --image_folder /home/c3-0/datasets/llava_665K/playground/data \
+    --video_folder /home/c3-0/datasets/Ego4D/videos/h264 \
+    --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_temporal_compressor" \
     --use_apt_temporal True \
     --apt_thresholds "4.0,6.0" \
     --apt_num_scales 3 \
-    --rlt_threshold 0.1 \
-    --apt_temporal_majority_ratio 0.5 \
-    --mm_vision_tower_lr=2e-6 \
+    --rlt_threshold 0.05 \
+    --rlt_temporal_pos_scale 0.0 \
+    --apt_temporal_majority_ratio 0.5  \
+    --frames_upbound 32 \
+    --video_fps 1 \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -1 \
@@ -56,7 +58,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
-    --logging_steps 1 \
+    --logging_steps 10 \
     --tf32 True \
     --model_max_length 32768 \
     --gradient_checkpointing False \

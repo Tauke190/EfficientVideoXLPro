@@ -312,8 +312,10 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         # APT-Temporal's own run-length embedding still needs including, though.
         if getattr(trainer.model.config, "use_apt_temporal", False):
             keys_to_match.append("apt_temporal_reuse_embed")
-        # Same reasoning for APT's patch_attn/zero_conv.
-        if getattr(trainer.model.config, "use_apt", False):
+        # Same reasoning for APT's patch_attn/zero_conv -- also trainable (and
+        # so also needs saving) under use_apt_temporal, since OVERRIDE events
+        # depend on them alone (see siglip_apt_temporal_embeddings.py).
+        if getattr(trainer.model.config, "use_apt", False) or getattr(trainer.model.config, "use_apt_temporal", False):
             keys_to_match.extend(["apt_patch_attn", "apt_zero_conv"])
 
         weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
@@ -1901,7 +1903,11 @@ def train(attn_implementation=None):
         # compensation for the quadtree merge (paper arXiv 2510.18091 Eq. 2). Same
         # reasoning as RLT's phi_L above -- keep them trainable whenever APT is
         # enabled, regardless of which other parts mm_tunable_parts covers.
-        if getattr(model.config, "use_apt", False):
+        # Also required for use_apt_temporal: OVERRIDE events (see
+        # siglip_apt_temporal_embeddings.py) skip the E(Resize_p) pixel anchor
+        # and rely on patch_attn/zero_conv alone, so they can no longer be left
+        # untrained in that path either.
+        if getattr(model.config, "use_apt", False) or getattr(model.config, "use_apt_temporal", False):
             apt_patch_attn = model.get_model().get_apt_patch_attn()
             apt_zero_conv = model.get_model().get_apt_zero_conv()
             apt_patch_attn.requires_grad_(True)

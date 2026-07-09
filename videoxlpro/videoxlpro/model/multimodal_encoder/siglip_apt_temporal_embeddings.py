@@ -25,13 +25,13 @@ no changes to siglip_apt_embeddings.py are needed. It reuses:
                              differently-scaled sub-cells).
   * apt._embed_patches      (frozen SigLIP patch_embedding Conv2d -- never
                              shown anything but a native 14x14 patch).
-  * apt.patch_attn / apt.zero_conv  (APT's trainable, zero-init spatial merge
-                             -- currently untrained per the settled decision
-                             not to backfill APT's training wiring here, so
-                             these numerically contribute nothing beyond the
-                             E(Resize_p) term today, but are wired in for
-                             forward-compatibility: if APT training is ever
-                             backfilled, TAPT benefits without a rewrite).
+  * apt.patch_attn / apt.zero_conv  (APT's trainable, zero-init spatial merge.
+                             OVERRIDE events (see classify_cells) skip the
+                             E(Resize_p) pixel-anchor term entirely and rely
+                             on this merge alone -- see the "OVERRIDE merge"
+                             comment in forward() below -- so these must be
+                             trained whenever use_apt_temporal is on, not
+                             just use_apt; train.py wires this up).
   * apt._run_encoder        (xformers block-diagonal attention over the
                              frozen SigLIP transformer layers).
   * apt.base_pos_embed / apt.base_grid_size (position embedding resampling).
@@ -238,23 +238,45 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
                 attn_out = attn_in.squeeze(-1).squeeze(-1)                 # (n_events, C)
                 merged = apt.zero_conv(attn_out)
 
+                new_g = apt.image_size // ps
+                resampled_pos = resample_abs_pos_embed(
+                    apt.base_pos_embed.to(frames.dtype), new_size=(new_g, new_g),
+                    old_size=(apt.base_grid_size, apt.base_grid_size), num_prefix_tokens=0,
+                )
+                pos_grid_ps = resampled_pos.view(new_g, new_g, C)
+                pos_for_events = pos_grid_ps.unsqueeze(0).expand(T, new_g, new_g, C)[event_mask]
+
+                # FRESH vs OVERRIDE events at this scale get different
+                # treatment (see apt_temporal_static_tokens.classify_cells):
+                #   FRESH    -- a genuinely new merge with no trustworthy prior
+                #               cache for its children -> anchor it with a
+                #               direct E(Resize_p) re-embed of the region, same
+                #               as ordinary per-frame APT does.
+                #   OVERRIDE -- majority of the children are unchanged and
+                #               already have valid cached embeddings (`merged`
+                #               above already mixes those cached values with a
+                #               fresh embed of the dirty minority); re-scanning
+                #               every pixel in the region again via E(Resize_p)
+                #               would just redo work the cache already has, so
+                #               skip it -- `merged` alone carries the token.
+                # NOTE: apt._embed_patches is a ZeRO-3-partitioned module, so its
+                # forward must be called unconditionally on every rank, every step --
+                # gating this on is_fresh_event.any() let ranks skip the call on
+                # steps where their local clip happened to have no FRESH cells at
+                # this scale, desyncing the all-gather collective sequence across
+                # ranks and deadlocking (NCCL watchdog timeout after 30 min).
+                is_fresh_event = (cls[:, ::s, ::s] == FRESH)[event_mask]      # (n_events,)
+                fresh_event_mask = event_mask & (cls[:, ::s, ::s] == FRESH)
                 event_masks_for_groups = {
-                    p: (event_mask.to(frames.dtype) if p == ps
+                    p: (fresh_event_mask.to(frames.dtype) if p == ps
                         else torch.zeros(T, apt.image_size // p, apt.image_size // p,
                                           device=dev, dtype=frames.dtype))
                     for p in apt.patch_sizes
                 }
                 patch_groups = apt.tokenizer.construct_patch_groups(frames, event_masks_for_groups)
                 resize_patches = patch_groups[f"resized_patches_{ps}"]
-                embed_scale = apt._embed_patches(resize_patches)           # (n_events, C)
-
-                new_g = apt.image_size // ps
-                resampled_pos = resample_abs_pos_embed(
-                    apt.base_pos_embed.to(frames.dtype), new_size=(new_g, new_g),
-                    old_size=(apt.base_grid_size, apt.base_grid_size), num_prefix_tokens=0,
-                )
-                pos_mask = patch_groups[f"pos_embed_mask_{ps}"]
-                pos_for_events = resampled_pos.repeat(T, 1, 1)[pos_mask]
+                embed_scale = torch.zeros_like(merged)
+                embed_scale[is_fresh_event] = apt._embed_patches(resize_patches).to(embed_scale.dtype)
 
                 token_value = merged + embed_scale.to(merged.dtype) + pos_for_events.to(merged.dtype)
 

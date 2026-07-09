@@ -274,13 +274,22 @@ class SiglipAPTEmbeddings(nn.Module):
                 embed_scale = self.zero_conv(attn_scale) + embed_scale + pos_embed
             else:
                 # No survivors at this scale: run zeros through the trainable
-                # modules so their params stay in the autograd/DDP graph.
+                # modules so their params stay in the autograd/DDP graph. Must
+                # call patch_attn scale_idx+1 times here too (matching the "if"
+                # branch's Conv2d^i loop) -- patch_attn is ZeRO-3-partitioned,
+                # so calling it a different number of times on different ranks
+                # (e.g. 1 vs 2 at the coarsest scale) desyncs the all-gather
+                # collective sequence across ranks and deadlocks (NCCL watchdog
+                # timeout after 30 min).
                 dummy_base = torch.zeros((1, 3, base_p, base_p), device=frames.device, dtype=embed16.dtype)
                 embed_scale = self._embed_patches(dummy_base)
-                dummy_full = torch.zeros((1, 3, base_p * 2, base_p * 2), device=frames.device, dtype=embed16.dtype)
-                dummy_full = self._embed_patches(dummy_full.reshape(-1, 3, base_p, base_p)).reshape(1, 2, 2, self.embed_dim)
+                n = cur_patch_size // base_p
+                dummy_full = torch.zeros((n * n, 3, base_p, base_p), device=frames.device, dtype=embed16.dtype)
+                dummy_full = self._embed_patches(dummy_full).view(1, n, n, self.embed_dim)
                 dummy_full = dummy_full.permute(0, 3, 1, 2)
-                attn_scale = self.patch_attn(dummy_full).squeeze(-1).squeeze(-1)
+                for _ in range(scale_idx + 1):                           # Conv2d^i, matches "if" branch
+                    dummy_full = self.patch_attn(dummy_full)
+                attn_scale = dummy_full.squeeze(-1).squeeze(-1)
                 embed_scale = self.zero_conv(attn_scale) + embed_scale
 
             expanded[output_mask == (scale_idx + 2)] = embed_scale.to(expanded.dtype)
