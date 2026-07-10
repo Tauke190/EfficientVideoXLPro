@@ -91,11 +91,13 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
             return s.getsockname()[1]
 
     @staticmethod
-    def _eval_cwd():
-        # `import videoxlpro` from the repo root resolves to the outer namespace
-        # directory rather than the package; lmms-eval/ is the cwd the working eval
-        # script uses, so borrow it.
-        return str(pathlib.Path(__file__).resolve().parents[3] / "lmms-eval")
+    def _repo_root():
+        return pathlib.Path(__file__).resolve().parents[3]
+
+    @classmethod
+    def _eval_cwd(cls):
+        # The cwd the working eval script (lmms-eval/scripts/eval_videoxl_pro.slurm) uses.
+        return str(cls._repo_root() / "lmms-eval")
 
     def _child_env(self):
         env = {
@@ -107,6 +109,18 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
         # lmms_eval would otherwise attach to this run's wandb process and interleave
         # its own step counter with the trainer's.
         env["WANDB_MODE"] = "disabled"
+
+        # The checkpoint's auto_map routes model loading through the CACHED HUB module
+        # (transformers_modules/MINT-SJTU/Video-XL-Pro-3B/<hash>/modeling_*.py), which
+        # imports the local package -- but which spelling it uses differs per machine,
+        # because that cache is edited in place: `videoxlpro.model...` on one box,
+        # `videoxlpro.videoxlpro.model...` on another. Putting the repo ROOT on the path
+        # makes `videoxlpro` a namespace package spanning both, so either spelling
+        # resolves. This is exactly what eval_videoxl_pro.slurm already exports, and cwd
+        # alone does not supply it.
+        root = str(self._repo_root())
+        prev = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{root}{os.pathsep}{prev}" if prev else root
         return env
 
     def _model_args(self, pretrained):
