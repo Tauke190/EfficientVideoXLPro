@@ -131,21 +131,45 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
         return env
 
     def _model_args(self, pretrained):
+        """Mirror the training model's token-reduction config onto the eval subprocess.
+
+        Must be exhaustive, not just the flags that look relevant. The eval wrapper
+        force-assigns EVERY one of these onto the loaded config after from_pretrained,
+        falling back to its own defaults for anything absent from --model_args. So an
+        omitted knob is not inherited from the checkpoint -- it is silently replaced,
+        and eval measures a model training never produced. rlt_threshold is the live
+        trap: the wrapper defaults to 0.1, training to 0.3.
+        """
         cfg = self._trainer.model.config
+        g = lambda name, default=None: getattr(cfg, name, default)
+
         args = [
             f"pretrained={pretrained}",
             f"max_frames_num={self._trainer.args.mlvu_eval_frames}",
             f"attn_implementation={self._trainer.args.attn_implementation}",
+            f"use_sae={g('use_sae', True)}",
         ]
         # lmms_eval splits --model_args on commas, so threshold lists travel colon-separated.
-        thresholds = ":".join(str(t) for t in getattr(cfg, "apt_thresholds", []) or [])
-        if getattr(cfg, "use_apt", False):
-            args += ["use_apt=True", f"apt_threshold={thresholds}", f"apt_num_scales={cfg.apt_num_scales}"]
-        elif getattr(cfg, "use_apt_temporal", False):
-            args += ["use_apt_temporal=True", f"apt_threshold={thresholds}",
-                     f"apt_num_scales={cfg.apt_num_scales}", f"rlt_threshold={cfg.rlt_threshold}"]
-        elif getattr(cfg, "use_rlt", False):
-            args += ["use_rlt=True", f"rlt_threshold={cfg.rlt_threshold}"]
+        thresholds = ":".join(str(t) for t in (g("apt_thresholds") or []))
+        if g("use_apt", False):
+            args += [
+                "use_apt=True",
+                f"apt_threshold={thresholds}",
+                f"apt_num_scales={g('apt_num_scales', 3)}",
+                f"apt_input_res={g('apt_input_res', 392)}",
+            ]
+        elif g("use_apt_temporal", False):
+            args += [
+                "use_apt_temporal=True",
+                f"apt_threshold={thresholds}",
+                f"apt_num_scales={g('apt_num_scales', 3)}",
+                f"apt_input_res={g('apt_input_res', 392)}",
+                f"rlt_threshold={g('rlt_threshold', 0.3)}",
+                f"apt_temporal_majority_ratio={g('apt_temporal_majority_ratio', 0.5)}",
+                f"apt_temporal_max_frames={g('apt_temporal_max_frames', 512)}",
+            ]
+        elif g("use_rlt", False):
+            args += ["use_rlt=True", f"rlt_threshold={g('rlt_threshold', 0.3)}"]
         return ",".join(args)
 
     def _build_cmd(self, pretrained, out_dir, args):
