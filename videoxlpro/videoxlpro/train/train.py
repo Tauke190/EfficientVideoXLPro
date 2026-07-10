@@ -47,6 +47,7 @@ from videoxlpro import conversation as conversation_lib
 from videoxlpro.model import *
 from videoxlpro.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
 from videoxlpro.utils import rank0_print, process_video_with_pyav
+from videoxlpro.train.mlvu_eval_callback import MLVUCheckpointEvalCallback
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -197,7 +198,17 @@ class TrainingArguments(transformers.TrainingArguments):
 
     group_by_stride: str = "none"
     sort_by_stride: Optional[str] = None
-    
+
+    # --- MLVU-on-checkpoint eval (see MLVUCheckpointEvalCallback) ---
+    mlvu_eval_on_save: bool = field(default=False, metadata={"help": "After every checkpoint save, run the lmms-eval MLVU harness on it in a subprocess and log accuracy to wandb. Requires --ddp_timeout > the eval wall clock."})
+    mlvu_eval_at_start: bool = field(default=False, metadata={"help": "Also score the starting weights once, before the first optimizer step, giving the wandb curve a step-0 baseline. Delays training by one MLVU pass."})
+    mlvu_eval_task: str = field(default="mlvu_test", metadata={"help": "lmms-eval task name to run on each checkpoint."})
+    mlvu_eval_limit: int = field(default=200, metadata={"help": "Pass --limit to lmms-eval. NOTE: --limit takes the FIRST N docs and MLVU ships grouped by task_type, so a small N covers only the first few of the nine categories while the aggregate still divides by nine. Comparable across steps, but not an accuracy. 0 = whole split."})
+    mlvu_eval_frames: int = field(default=128, metadata={"help": "max_frames_num for the eval subprocess (independent of training's frames_upbound)."})
+    mlvu_eval_num_processes: int = field(default=0, metadata={"help": "Processes for the eval subprocess. 0 = reuse the training world size (one per visible GPU)."})
+    mlvu_eval_python: str = field(default="", metadata={"help": "Interpreter for the eval subprocess. Empty = sys.executable (same conda env as training)."})
+    mlvu_eval_timeout: int = field(default=7200, metadata={"help": "Seconds before the eval subprocess is killed. Keep below --ddp_timeout so the barrier outlives the subprocess."})
+
     # use_reentrant: bool = field(default=False)
 
 # @dataclass
@@ -1975,6 +1986,25 @@ def train(attn_implementation=None):
     if getattr(model.config, "use_apt", False) or getattr(model.config, "use_apt_temporal", False):
         trainer.add_callback(AptModuleNormCallback(model))
         rank0_print("[APT] AptModuleNormCallback registered: logging apt/*_wnorm + apt/*_wdelta_from_init to wandb.")
+
+    if training_args.mlvu_eval_on_save or training_args.mlvu_eval_at_start:
+        if training_args.ddp_timeout <= training_args.mlvu_eval_timeout:
+            raise ValueError(
+                f"--ddp_timeout ({training_args.ddp_timeout}s) must exceed --mlvu_eval_timeout "
+                f"({training_args.mlvu_eval_timeout}s): while rank 0 runs the eval subprocess the "
+                f"other ranks block in a barrier, and the process group aborts the job when it expires."
+            )
+        # The step-0 baseline must score whatever training actually starts from -- the
+        # resumed checkpoint when there is one, otherwise the pretrained model.
+        last_ckpt = transformers.trainer_utils.get_last_checkpoint(training_args.output_dir) if os.path.isdir(training_args.output_dir) else None
+        baseline_path = last_ckpt or model_args.model_name_or_path
+        trainer.add_callback(MLVUCheckpointEvalCallback(trainer, baseline_path=baseline_path))
+        rank0_print(
+            f"[MLVU] MLVUCheckpointEvalCallback registered: {training_args.mlvu_eval_task} "
+            f"(limit={training_args.mlvu_eval_limit}, frames={training_args.mlvu_eval_frames}); "
+            f"at_start={training_args.mlvu_eval_at_start} (baseline={baseline_path}), "
+            f"on_save={training_args.mlvu_eval_on_save} (every {training_args.save_steps} steps)."
+        )
 
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):

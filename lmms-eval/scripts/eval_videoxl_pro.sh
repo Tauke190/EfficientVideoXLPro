@@ -5,27 +5,40 @@ export HF_HOME=/mnt/SSD2/huggingface
 
 # For HPC 
 # export PYTHONPATH=/home/av354855/EfficientVideoXLPro:$PYTHONPATH
-# export HF_HOME=/home/c3-0/datasets/huggingface
+# export HF_HOME=~/.cache/huggingface
 
-export CUDA_VISIBLE_DEVICES=0,2
+export CUDA_VISIBLE_DEVICES=0,1,2
 # --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,use_rlt=True,rlt_threshold=0.2 \
 # --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt=True,apt_threshold=4.0:6.0,apt_num_scales=3 \
 # --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,use_rlt=True,rlt_threshold=0.2 \
-# --model_args pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-finetune-llava665k-without-DTS,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=False \
+# --model_args pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-apt-llava-ego4D,max_frames_num=128,attn_implementation=flash_attention_2,use_apt=True,apt_threshold=4.0:6.0,apt_num_scales=3 \
 # --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=False \
+# --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt_temporal=True,rlt_threshold=0.2,rlt_temporal_pos_scale=0.0,apt_threshold=4.0:6.0,apt_num_scales=3 \
 
 # use_apt_temporal
 LOG_DIR="./logs/videoxlpro_mlvu"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/eval_apttemporal_$(date +%Y%m%d_%H%M%S).log"
 
+
 #[ use_apt , use_rlt , use_apt_temporal]
 
-accelerate launch --num_processes=2 --main_process_port 12345 \
+args=(
+  "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-apt-llava-ego4D/checkpoint-3000"
+  "max_frames_num=128"
+  "attn_implementation=flash_attention_2"
+
+  "use_apt=True"
+  "apt_threshold=4.0:6.0"
+  "apt_num_scales=3"
+)
+MODEL_ARGS=$(IFS=,; echo "${args[*]}")
+
+accelerate launch --num_processes=3 --main_process_port 12345 \
     -m lmms_eval \
     --model videoxlpro \
     --tasks mlvu_test \
-    --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt_temporal=True,rlt_threshold=0.2,rlt_temporal_pos_scale=0.0 \
+    --model_args "$MODEL_ARGS" \
     --batch_size 1 \
     --log_samples \
     --log_samples_suffix videoxlpro_mlvu \

@@ -42,7 +42,7 @@ class VideoXLPro(lmms):
         rlt_threshold: Optional[float] = 0.1,
         rlt_temporal_pos_scale: Optional[float] = 0.0,
         use_apt: Optional[bool] = False,
-        apt_threshold: Optional[float] = 4.0,
+        apt_threshold: Optional[str] = "4.0:6.0",
         apt_thresholds: Optional[str] = None,
         apt_num_scales: Optional[int] = 3,
         apt_input_res: Optional[int] = 392,
@@ -108,6 +108,10 @@ class VideoXLPro(lmms):
         # lmms_eval splits --model_args on commas. Either key works, and each may
         # be a single value (broadcast to all non-base scales) or a COLON-separated
         # list, e.g.  apt_threshold=4.0  or  apt_threshold=4.0:5.0.
+        # The default must stay in step with train.py's apt_thresholds ("4.0,6.0")
+        # and llava_arch._get_apt_module's own fallback ([4.0, 6.0]): entropy grows
+        # with patch area, so broadcasting one scalar across scales makes the
+        # coarsest scale far stricter than intended and silently suppresses it.
         raw = apt_thresholds if apt_thresholds is not None else apt_threshold
         thresholds = [float(p) for p in str(raw).replace(",", ":").split(":") if p != ""]
         n_needed = int(apt_num_scales) - 1

@@ -34,10 +34,6 @@ def load_video(video_path, max_frames_num):
     frame_idx = uniform_sampled_frames.tolist()
     spare_frames = vr.get_batch(frame_idx).asnumpy()
 
-    frame_idx = uniform_sampled_frames.tolist()
-
-    spare_frames = vr.get_batch(frame_idx).asnumpy()
-
     timestamps = [round(frame_index / fps, 1) for frame_index in frame_idx]
     #print(timestamps)
     return spare_frames,timestamps

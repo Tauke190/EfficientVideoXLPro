@@ -9,7 +9,7 @@ MODEL_PATH="MINT-SJTU/Video-XL-Pro-3B"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
 PROMPT_VERSION=qwen_1_5
-MID_RUN_NAME="videoxlpro-3b-apt-only-llava&ego4D"
+MID_RUN_NAME="videoxlpro-3b-apt-only-llava-ego4D"
 
 echo "Fine-tuning run: ${MID_RUN_NAME}"
 
@@ -50,8 +50,15 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --evaluation_strategy "steps" \
     --eval_steps 100 \
     --save_strategy "steps" \
-    --save_steps 3000 \
+    --save_steps 500 \
     --save_total_limit 2 \
+    --mlvu_eval_on_save True \
+    --mlvu_eval_at_start True \
+    --mlvu_eval_task mlvu_test \
+    --mlvu_eval_limit 10 \
+    --mlvu_eval_frames 128 \
+    --mlvu_eval_timeout 7200 \
+    --ddp_timeout 14400 \
     --learning_rate 2e-5 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
