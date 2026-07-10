@@ -46,9 +46,6 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 4 \
-    --eval_num_samples 50 \
-    --evaluation_strategy "steps" \
-    --eval_steps 100 \
     --save_strategy "steps" \
     --save_steps 500 \
     --save_total_limit 2 \
