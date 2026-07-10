@@ -182,21 +182,35 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
             raise FileNotFoundError(f"no *_results.json under {out_dir}")
         with open(results[-1]) as f:
             blob = json.load(f)
+
+        # mlvu_aggregate_results_* always divides by all NINE task categories, even ones
+        # with zero sampled docs -- and --limit takes the FIRST N docs of a split that
+        # ships grouped by category. So macro_avg is only interpretable when every
+        # category is represented; below that it is (categories seen) / 9.
         metrics = {"mlvu/macro_avg": blob["results"][task]["mlvu_percetion_score,none"]}
 
         samples = sorted(out.glob(f"**/*_samples_{task}.jsonl"))
         if samples:
-            tally = {}
+            tally, unanswered = {}, 0
             with open(samples[-1]) as f:
                 for line in f:
                     d = json.loads(line).get("mlvu_percetion_score")
                     if not isinstance(d, dict):
                         continue
+                    unanswered += int(not d["pred_answer"])
                     hit, seen = tally.get(d["task_type"], (0, 0))
                     tally[d["task_type"]] = (hit + int(d["pred_answer"] == d["answer"]), seen + 1)
             for cat, (hit, seen) in sorted(tally.items()):
                 metrics[f"mlvu/{cat}"] = 100.0 * hit / seen
-            metrics["mlvu/n_scored"] = sum(seen for _, seen in tally.values())
+            scored = sum(seen for _, seen in tally.values())
+            # Plain accuracy over the docs actually sampled: unlike macro_avg this stays
+            # meaningful at any --limit, so it is the number to watch across steps.
+            metrics["mlvu/accuracy"] = 100.0 * sum(h for h, _ in tally.values()) / scored if scored else 0.0
+            # A prediction the extractor could not read at all. If this equals n_scored,
+            # the harness produced nothing -- missing videos, a broken generate -- and the
+            # 0% is a plumbing failure, not a model result.
+            metrics["mlvu/n_unanswered"] = unanswered
+            metrics["mlvu/n_scored"] = scored
             metrics["mlvu/n_categories"] = len(tally)
         return metrics
 
