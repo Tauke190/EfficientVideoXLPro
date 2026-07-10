@@ -121,6 +121,13 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
         root = str(self._repo_root())
         prev = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = f"{root}{os.pathsep}{prev}" if prev else root
+
+        # mlvu/utils.py resolves video paths from HF_HOME, and its fallback is broken:
+        # os.path.expanduser("./~/.cache/huggingface") leaves the "~" literal, so with
+        # HF_HOME unset every video "goes missing", doc_to_visual returns [], and every
+        # prediction is the empty string -- a silent 0% rather than an error. The
+        # training scripts do not export HF_HOME; the standalone eval scripts do.
+        env.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
         return env
 
     def _model_args(self, pretrained):
