@@ -169,7 +169,15 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
                 f"apt_temporal_max_frames={g('apt_temporal_max_frames', 512)}",
             ]
         elif g("use_rlt", False):
-            args += ["use_rlt=True", f"rlt_threshold={g('rlt_threshold', 0.3)}"]
+            # rlt_temporal_pos_scale must travel even though training and the wrapper now
+            # agree on 0.0: the wrapper force-assigns its own default whenever the knob is
+            # absent from --model_args, so a run that raises it (the ragged use_sae=False
+            # path needs >0) would otherwise be evaluated with the sinusoid switched off.
+            args += [
+                "use_rlt=True",
+                f"rlt_threshold={g('rlt_threshold', 0.3)}",
+                f"rlt_temporal_pos_scale={g('rlt_temporal_pos_scale', 0.0)}",
+            ]
         return ",".join(args)
 
     def _build_cmd(self, pretrained, out_dir, args):
@@ -192,6 +200,23 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
         if args.mlvu_eval_limit > 0:
             cmd += ["--limit", str(args.mlvu_eval_limit)]
         return cmd
+
+    # The only keys that reach wandb. accuracy is the one to trust at a truncated
+    # --limit; macro_avg is kept alongside it because it is what the published MLVU
+    # numbers report. Per-category accuracies and sample counts stay in the log.
+    _WANDB_KEYS = ("mlvu/macro_avg", "mlvu/accuracy")
+
+    @staticmethod
+    def _summarize(metrics):
+        """One console line: headline numbers first, then counts, then categories."""
+        def fmt(k):
+            v = metrics[k]
+            return f"{k.split('/')[-1]}={v:d}" if isinstance(v, int) else f"{k.split('/')[-1]}={v:.1f}"
+
+        lead = [k for k in ("mlvu/accuracy", "mlvu/macro_avg") if k in metrics]
+        counts = [k for k in ("mlvu/n_scored", "mlvu/n_unanswered", "mlvu/n_categories") if k in metrics]
+        cats = sorted(set(metrics) - set(lead) - set(counts))
+        return " ".join(fmt(k) for k in lead + counts + cats)
 
     def _parse(self, out_dir, task):
         """Aggregate score plus per-category accuracy recovered from the samples file.
@@ -312,11 +337,14 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
                 try:
                     import wandb
                     if wandb.run is not None:
-                        wandb.log(metrics, step=step)
+                        wandb.log({k: metrics[k] for k in self._WANDB_KEYS if k in metrics}, step=step)
                 except Exception:
                     pass
-                summary = " ".join(f"{k.split('/')[-1]}={v:.1f}" for k, v in sorted(metrics.items()))
-                rank0_print(f"[step={step}] MLVU {summary}")
+                # Everything else -- per-category accuracies, n_unanswered -- stays in the
+                # log rather than wandb. n_unanswered in particular separates "the model
+                # scored 0%" from "every video failed to load and the harness returned
+                # empty strings", which the two headline numbers alone cannot distinguish.
+                rank0_print(f"[step={step}] MLVU {self._summarize(metrics)}")
 
         # Rank 0 was gone for the whole eval; the others rejoin the training loop here.
         self._barrier()

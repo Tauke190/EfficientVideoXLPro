@@ -116,7 +116,7 @@ class ModelArguments:
     rlt_threshold: float = field(default=0.3, metadata={"help": "Mean abs pixel-change threshold for dropping temporally-redundant tokens."})
     rlt_max_frames: int = field(default=512)
     rlt_patch_size: int = field(default=14)
-    rlt_temporal_pos_scale: float = field(default=1.0, metadata={"help": "Magnitude of the fixed temporal-position sinusoid added to survivors, as a multiple of the per-clip SigLIP feature RMS (1.0 = same scale as the features; 0 disables). RLT adds only this scale-matched temporal position -- no learnable state at the seam."})
+    rlt_temporal_pos_scale: float = field(default=0.0, metadata={"help": "Magnitude of the fixed temporal-position sinusoid added to survivors, as a multiple of the per-clip SigLIP feature RMS (1.0 = same scale as the features; 0 disables). RLT adds only this scale-matched temporal position -- no learnable state at the seam. Defaults to 0 to match the eval wrapper and the composed (use_sae=True) path, where the SAE already supplies temporal information and the extra sinusoid only perturbs it; set >0 only on the ragged path (use_sae=False), where nothing else encodes temporal order."})
 
     # Adaptive Patch Transformer (APT) at the SigLIP embedding seam -- per-frame
     # spatial quadtree merge. These fields previously had no CLI/dataclass home
