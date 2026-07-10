@@ -179,6 +179,32 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
             metrics["mlvu/n_categories"] = len(tally)
         return metrics
 
+    @staticmethod
+    def _write_child_logs(out_dir, proc):
+        for name, text in (("eval_stdout.log", proc.stdout), ("eval_stderr.log", proc.stderr)):
+            try:
+                with open(os.path.join(out_dir, name), "w") as f:
+                    f.write(text or "")
+            except OSError:
+                pass
+
+    @staticmethod
+    def _failure_report(step, exc, cmd, proc, out_dir):
+        """Everything needed to diagnose the eval without re-running training."""
+        import shlex
+        lines = [f"[MLVU] step={step} eval FAILED, training continues: {exc}"]
+        if cmd:
+            lines.append("  rerun: " + " ".join(shlex.quote(c) for c in cmd))
+        lines.append(f"  logs:  {os.path.join(out_dir, 'eval_stderr.log')}")
+        stderr = getattr(proc, "stderr", None) or getattr(exc, "stderr", None)
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", "replace")
+        if stderr:
+            tail = stderr.strip().splitlines()[-30:]
+            lines.append("  child stderr (last 30 lines):")
+            lines += ["    " + ln for ln in tail]
+        return "\n".join(lines)
+
     def _run_eval(self, step, pretrained, args):
         """Score `pretrained` (a checkpoint dir, or a hub id for the step-0 baseline).
 
@@ -198,6 +224,7 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
             rank0_print(f"[MLVU] step={step} evaluating {pretrained}")
             # Everything rank 0 does here is inside the try: an exception escaping
             # would strand the other ranks in the barrier below until ddp_timeout.
+            cmd, proc = None, None
             try:
                 os.makedirs(out_dir, exist_ok=True)
                 cmd = self._build_cmd(pretrained, out_dir, args)
@@ -209,12 +236,17 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
                     capture_output=True,
                     text=True,
                 )
+                # lmms-eval catches evaluation errors, prints the traceback, and STILL
+                # exits 0 (__main__.cli_evaluate, unless --verbosity=DEBUG), so a clean
+                # return code proves nothing. Keep the child's output either way -- the
+                # traceback is the only record of why an eval produced no results.
+                self._write_child_logs(out_dir, proc)
                 if proc.returncode != 0:
-                    raise RuntimeError(f"exit {proc.returncode}\n{proc.stderr[-2000:]}")
+                    raise RuntimeError(f"lmms-eval exited {proc.returncode}")
                 metrics = self._parse(out_dir, args.mlvu_eval_task)
             except Exception as e:
                 # A broken eval must never take the training run down with it.
-                rank0_print(f"[MLVU] step={step} eval FAILED, training continues: {e}")
+                rank0_print(self._failure_report(step, e, cmd, proc, out_dir))
                 metrics = None
 
             if metrics:
