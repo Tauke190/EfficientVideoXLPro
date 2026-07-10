@@ -189,8 +189,12 @@ class LlavaMetaModel:
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
         
-        self.sae=SiglipAE()
-        #self.sae.load_state_dict(torch.load('/share/LXRlxr0_0/code/videoxlturbo2.0/videoxl_adaptfps/longva/longva/model/encoder.pth'),strict=False)
+        # __init__ already builds self.sae, and from_pretrained fills it with the
+        # checkpoint's trained weights. Rebuilding it here would silently discard
+        # them -- initialize_vision_modules runs *after* from_pretrained. Only
+        # construct when genuinely absent (pretrain from a bare LLM).
+        if getattr(self, "sae", None) is None:
+            self.sae = SiglipAE()
         ##############################################################################
 #         self.vision_select=nn.Parameter(
 #                 torch.randn((30, self.config.hidden_size), dtype=self.dtype)

@@ -24,10 +24,9 @@ LOG_FILE="$LOG_DIR/eval_apttemporal_$(date +%Y%m%d_%H%M%S).log"
 #[ use_apt , use_rlt , use_apt_temporal]
 
 args=(
-  "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-apt-llava-ego4D/checkpoint-3000"
+  "pretrained=MINT-SJTU/Video-XL-Pro-3B"
   "max_frames_num=128"
   "attn_implementation=flash_attention_2"
-
   "use_apt=True"
   "apt_threshold=4.0:6.0"
   "apt_num_scales=3"
@@ -40,6 +39,7 @@ accelerate launch --num_processes=3 --main_process_port 12345 \
     --tasks mlvu_test \
     --model_args "$MODEL_ARGS" \
     --batch_size 1 \
+    --limit 100 \
     --log_samples \
     --log_samples_suffix videoxlpro_mlvu \
     --output_path "$LOG_DIR" \

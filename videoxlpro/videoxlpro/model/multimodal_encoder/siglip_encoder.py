@@ -92,6 +92,11 @@ class SigLipVisionTower(BaseVisionTower):
             self.cfg_only = self.config
 
     def load_model(self, device_map=None):
+        # Reloading stock SigLIP over an already-populated tower would discard the
+        # fine-tuned vision weights that from_pretrained just loaded.
+        if self.is_loaded:
+            rank0_print(f"{self.vision_tower_name} is already loaded, skipping load_model.")
+            return
         self.vision_model = "siglip"
         # clip_model, processor = create_model_from_pretrained(self.vision_tower_name)
         self.vision_tower = SiglipVisionModel.from_pretrained(self.vision_tower_name)
