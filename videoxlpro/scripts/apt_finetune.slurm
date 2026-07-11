@@ -55,6 +55,18 @@ export ADDR=localhost
 export DS_SKIP_CUDA_CHECK=1
 
 
+# NCCL Flight Recorder: if a collective ever desyncs across ranks again (see
+# the step-3204 hang on job 351066 -- ALLGATHER_BASE timeout after the full
+# ddp_timeout with zero other diagnostic info), this dumps each rank's recent
+# collective history to disk the moment the watchdog times out, instead of
+# leaving nothing but a bare "ran for N ms" message. Both env var spellings
+# set since the flight-recorder vars were renamed across torch versions.
+export NCCL_DEBUG=INFO
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export NCCL_TRACE_BUFFER_SIZE=2000
+export NCCL_DUMP_ON_TIMEOUT=1
+
 export WANDB_PROJECT="videoxlpro-apt"
 export WANDB_ENTITY="ag8093-university-of-central-florida"
 export WANDB_DIR="/home/av354855/EfficientVideoXLPro/videoxlpro"
@@ -63,7 +75,7 @@ MODEL_PATH="MINT-SJTU/Video-XL-Pro-3B"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
 PROMPT_VERSION=qwen_1_5
-MID_RUN_NAME="videoxlpro-3b-apt-llava&ego4D"
+MID_RUN_NAME="videoxlpro-3b-apt-llava-ego4D"
 
 echo "Fine-tuning run: ${MID_RUN_NAME}"
 
@@ -104,7 +116,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --save_steps 3000 \
     --save_total_limit 2 \
     --mlvu_eval_on_save True \
-    --mlvu_eval_at_start True \
+    --mlvu_eval_at_start False \
     --mlvu_eval_task mlvu_test \
     --mlvu_eval_limit 100 \
     --mlvu_eval_frames 128 \

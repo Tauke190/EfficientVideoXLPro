@@ -94,6 +94,80 @@ def batched_find_idxs_to_keep(
     return keep_idxs
 
 
+@torch.no_grad()
+def batched_find_idxs_to_keep_ref(
+    x: torch.Tensor,
+    threshold: float = 0.045,
+    patch_size: int = 14,
+    refresh_every: int = 0,
+) -> torch.Tensor:
+    """Keep-mask that diffs against the CARRIED reference, not the previous frame.
+
+    Fixes a latent bug in the reference RLT implementation. batched_find_idxs_to_keep
+    (above, faithful to the paper) tests
+
+        |frame_t - frame_{t-1}| <= threshold   ->   drop
+
+    but a dropped token is later reused from frame t0 = the last frame it SURVIVED,
+    which may be many frames back. The condition that is tested is therefore not the
+    condition that is relied on. A patch drifting slowly (say 0.01/frame) never trips
+    the consecutive test, yet after 15 frames it has moved 0.15 -- far from the frame
+    whose features it is actually carrying. The error is unbounded and accumulates with
+    run length.
+
+    This variant compares each patch against the reference it would REUSE, refreshing
+    that reference only where a patch survives. Drift is then bounded by `threshold`
+    by construction: a token is dropped only if it is still within threshold of the
+    exact frame its features come from.
+
+    Costs a modest amount of extra keep rate (the drift this catches was previously
+    being silently accepted), and requires a sequential scan over frames -- cheap, since
+    it is elementwise work on raw pixels, not encoder work.
+
+    Invisible on fixed-camera datasets (Kinetics/SSv2, where the paper was validated);
+    fires hard on egocentric / moving-camera video, where slow global drift is the norm.
+
+    Args:
+        x: (B, C, T, H, W) video tensor. tubelet_size is implicitly 1 (SigLIP is a 2D
+           encoder, so a token is one frame deep).
+        threshold: mean abs change above which a token is kept.
+        patch_size: spatial patch size.
+        refresh_every: if > 0, force-keep every Nth frame. Bounds how STALE a carried
+            token can get (the reference test bounds how far its pixels drifted, but not
+            how far its surrounding context has moved on). 0 disables.
+
+    Returns:
+        keep_idxs: (B, T*h*w) bool, True = keep, in (t, h, w) raster order.
+    """
+    assert len(x.shape) == 5, "Input must be a 5D tensor (B, C, T, H, W)"
+    B, C, T, H, W = x.shape
+    x = x.type(torch.float32)
+
+    h, w = H // patch_size, W // patch_size
+    # avg_pool discards any ragged border; crop so the reference update lines up exactly.
+    x = x[:, :, :, : h * patch_size, : w * patch_size]
+
+    keep = torch.zeros(B, T, h, w, dtype=torch.bool, device=x.device)
+    keep[:, 0] = True                       # RLT always keeps all of frame 0
+    ref = x[:, :, 0].clone()                # (B, C, H', W') pixels each patch carries
+
+    for t in range(1, T):
+        cur = x[:, :, t]                                            # (B, C, H', W')
+        if refresh_every and t % refresh_every == 0:
+            k = torch.ones(B, h, w, dtype=torch.bool, device=x.device)
+        else:
+            d = F.avg_pool2d((cur - ref).abs(), patch_size).mean(dim=1)   # (B, h, w)
+            k = d > threshold
+        keep[:, t] = k
+        # Refresh the reference ONLY where the patch survived; dropped patches keep
+        # carrying the pixels their features were actually computed from.
+        up = k.float().repeat_interleave(patch_size, -2).repeat_interleave(patch_size, -1)
+        up = up.unsqueeze(1)                                        # (B, 1, H', W')
+        ref = ref * (1 - up) + cur * up
+
+    return keep.flatten(1)                  # (B, T*h*w), (t,h,w) order
+
+
 if __name__ == "__main__":
     # ---- self-test on a controlled synthetic clip --------------------------
     torch.manual_seed(0)

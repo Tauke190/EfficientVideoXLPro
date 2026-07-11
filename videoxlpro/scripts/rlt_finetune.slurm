@@ -93,12 +93,15 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 4 \
-    --eval_num_samples 50 \
-    --evaluation_strategy "steps" \
-    --eval_steps 100 \
-    --save_strategy "steps" \
     --save_steps 3000 \
     --save_total_limit 2 \
+    --mlvu_eval_on_save True \
+    --mlvu_eval_at_start False \
+    --mlvu_eval_task mlvu_test \
+    --mlvu_eval_limit 100 \
+    --mlvu_eval_frames 128 \
+    --mlvu_eval_timeout 7200 \
+    --ddp_timeout 14400 \
     --learning_rate 1e-5 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \

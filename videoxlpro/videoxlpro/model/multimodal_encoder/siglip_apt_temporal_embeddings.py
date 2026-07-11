@@ -159,7 +159,7 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
             origin_index: (T, G, G) long, for apt_temporal_scatter_back.
             T: frames in the clip.
             P: dense patch count per frame (G*G), matching one clip's vision
-                output (same contract as apt_scatter_back / _rlt_scatter_back).
+                output (same contract as apt_scatter_back).
         """
         apt = self.apt
         T = pixel_values.shape[0]

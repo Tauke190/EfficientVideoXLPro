@@ -41,6 +41,9 @@ class VideoXLPro(lmms):
         use_rlt: Optional[bool] = False,
         rlt_threshold: Optional[float] = 0.1,
         rlt_temporal_pos_scale: Optional[float] = 0.0,
+        rlt_attn_mode: Optional[str] = "reuse",
+        rlt_mask_mode: Optional[str] = "ref",
+        rlt_refresh_every: Optional[int] = 0,
         use_apt: Optional[bool] = False,
         apt_threshold: Optional[str] = "4.0:6.0",
         apt_thresholds: Optional[str] = None,
@@ -97,6 +100,13 @@ class VideoXLPro(lmms):
         # info, so the extra sinusoid only perturbs it. Ragged path (use_sae=False):
         # set >0 (e.g. 1.0) since nothing else provides temporal order.
         self._model.config.rlt_temporal_pos_scale = rlt_temporal_pos_scale
+        # "reuse" = survivors attend over the full frame (dropped tokens supply carried
+        # k/v); "per_frame" = legacy starved attention, kept for the ablation.
+        self._model.config.rlt_attn_mode = rlt_attn_mode
+        # "ref" = drop test compares against the frame a patch is actually reused from
+        # (bounds drift); "consec" = legacy paper behaviour. refresh_every bounds staleness.
+        self._model.config.rlt_mask_mode = rlt_mask_mode
+        self._model.config.rlt_refresh_every = int(rlt_refresh_every)
         # APT (spatial adaptive patches) and APT-Temporal (APT + temporal
         # redundancy collapsing on top) -- mutually exclusive with use_rlt
         # and with each other, so each method's gain is measured independently.

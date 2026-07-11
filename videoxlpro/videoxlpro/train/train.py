@@ -116,6 +116,9 @@ class ModelArguments:
     rlt_threshold: float = field(default=0.3, metadata={"help": "Mean abs pixel-change threshold for dropping temporally-redundant tokens."})
     rlt_max_frames: int = field(default=512)
     rlt_patch_size: int = field(default=14)
+    rlt_attn_mode: str = field(default="reuse", metadata={"help": "How survivors attend inside SigLIP. 'reuse' (default): survivors attend over the full P-token frame, with dropped tokens supplying the keys/values they carry from their last surviving copy -- reduces to dense SigLIP at 100% keep. 'per_frame' (legacy): survivors attend ONLY to each other, starving them of their own frame's context. Kept for ablation."})
+    rlt_mask_mode: str = field(default="ref", metadata={"help": "What the drop test compares against. 'ref' (default): the frame each patch will actually be REUSED from, so drift is bounded by rlt_threshold by construction. 'consec' (legacy/paper): frame t-1, while reusing from the last SURVIVING frame -- a different reference, so slow drift is never detected and accumulates. Kept for ablation."})
+    rlt_refresh_every: int = field(default=0, metadata={"help": "Force-keep every Nth frame, bounding how STALE a carried token can get (rlt_mask_mode='ref' bounds pixel drift, but not how far a token's surrounding context has moved on). 0 = off."})
     rlt_temporal_pos_scale: float = field(default=0.0, metadata={"help": "Magnitude of the fixed temporal-position sinusoid added to survivors, as a multiple of the per-clip SigLIP feature RMS (1.0 = same scale as the features; 0 disables). RLT adds only this scale-matched temporal position -- no learnable state at the seam. Defaults to 0 to match the eval wrapper and the composed (use_sae=True) path, where the SAE already supplies temporal information and the extra sinusoid only perturbs it; set >0 only on the ragged path (use_sae=False), where nothing else encodes temporal order."})
 
     # Adaptive Patch Transformer (APT) at the SigLIP embedding seam -- per-frame
@@ -1821,6 +1824,9 @@ def train(attn_implementation=None):
         model.config.rlt_max_frames = model_args.rlt_max_frames
         model.config.rlt_patch_size = model_args.rlt_patch_size
         model.config.rlt_temporal_pos_scale = model_args.rlt_temporal_pos_scale
+        model.config.rlt_attn_mode = model_args.rlt_attn_mode
+        model.config.rlt_mask_mode = model_args.rlt_mask_mode
+        model.config.rlt_refresh_every = model_args.rlt_refresh_every
 
         # APT config -> model.config (patch_attn/zero_conv trainability is handled
         # below, same as RLT's phi_L; see the ModelArguments field comments).

@@ -221,7 +221,7 @@ def compute_origin_index(event_mask: torch.Tensor) -> torch.Tensor:
     """(T,G,G) bool "is this a new/refresh event here" -> (T,G,G) long: the
     most recent frame index t' <= t (per base cell) where event_mask was True.
 
-    Mirrors llava_arch.py's _rlt_scatter_back cummax/gather pattern. Used both
+    Mirrors the RLT carry-forward cummax/gather pattern (siglip_rlt_embeddings._carry_idx). Used both
     for (a) which packed merged-token row supplies (t,i,j)'s dense output
     value [event_mask = is_new_token], and (b) which frame's per-tile
     frozen-encoder embedding a base tile's cached value comes from

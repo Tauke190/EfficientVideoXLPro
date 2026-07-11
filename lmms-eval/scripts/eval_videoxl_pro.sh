@@ -27,9 +27,9 @@ args=(
   "pretrained=MINT-SJTU/Video-XL-Pro-3B"
   "max_frames_num=128"
   "attn_implementation=flash_attention_2"
-  "use_apt=True"
-  "apt_threshold=4.0:6.0"
-  "apt_num_scales=3"
+  "use_rlt=True"
+  "rlt_attn_mode=reuse"
+  "rlt_threshold=0.2"
 )
 MODEL_ARGS=$(IFS=,; echo "${args[*]}")
 
@@ -39,7 +39,6 @@ accelerate launch --num_processes=3 --main_process_port 12345 \
     --tasks mlvu_test \
     --model_args "$MODEL_ARGS" \
     --batch_size 1 \
-    --limit 100 \
     --log_samples \
     --log_samples_suffix videoxlpro_mlvu \
     --output_path "$LOG_DIR" \
@@ -92,3 +91,12 @@ echo "========================================"
 # 2026-06-25 07:08:07 | INFO     | utils:mlvu_aggregate_results_test:173 - Evaluation on Task Categories: ego: 0.0%
 # 2026-06-25 07:08:07 | INFO     | utils:mlvu_aggregate_results_test:181 - Average Performance Across All Task Categories: 16.0%
 # 2026-06-25 07:08:07 | INFO     | utils:mlvu_aggregate_results_test:182 - Videos skipped (not found): 0
+
+# A — baseline: native 27×27 @ 384px, 729 tok/frame
+# pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt=False
+
+# B — regrid only: 28×28 @ 392px, 784 tok/frame, nothing merges
+# pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt=True,apt_threshold=-1.0:-1.0,apt_num_scales=3
+
+# C — full APT: what you've been running
+# pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt=True,apt_threshold=4.0:6.0,apt_num_scales=3

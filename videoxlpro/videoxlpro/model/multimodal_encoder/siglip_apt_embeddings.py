@@ -102,7 +102,34 @@ def apt_scatter_back(
         dense[mup] = up[mup]
         covered += mup.to(covered.dtype)
 
-    assert torch.all(covered == 1), "apt_scatter_back: partition must cover each base cell exactly once"
+    if not torch.all(covered == 1):
+        # Deliberately NOT a bare assert: this is the one place a rare entropy-threshold
+        # edge case could make the partition invariant fail on a SINGLE rank while its
+        # peers proceed normally. A plain assert kills this rank silently; the other
+        # rank(s) then hang at their next ZeRO-3 all-gather waiting on a rank that is
+        # never coming, invisible until ddp_timeout (see the job-351066 step-3204 hang --
+        # an ALLGATHER_BASE timeout with zero information about which rank/why). Print
+        # rich diagnostics AND raise loud, so this shows up attributably instead of as
+        # another silent multi-hour stall.
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else "n/a"
+        )
+        bad = covered != 1
+        counts = {int(v): int((covered == v).sum()) for v in covered.unique().tolist()}
+        bad_tzhw = bad.nonzero(as_tuple=False)[:10].tolist()
+        msg = (
+            f"[APT] apt_scatter_back: partition invariant violated on rank {rank} -- "
+            f"{int(bad.sum())}/{covered.numel()} base cells not covered exactly once "
+            f"(coverage-count histogram {{count: num_cells}}={counts}; "
+            f"first offending (t,h,w) indices={bad_tzhw}). "
+            f"This is a single-rank failure: in a distributed run, other ranks will now hang "
+            f"at their next collective waiting on this rank, which is about to die -- kill the "
+            f"job rather than waiting out ddp_timeout."
+        )
+        print(msg, flush=True)
+        raise RuntimeError(msg)
     return dense.view(T, G * G, C)
 
 

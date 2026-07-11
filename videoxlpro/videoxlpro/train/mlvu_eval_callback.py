@@ -175,7 +175,7 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
             # path needs >0) would otherwise be evaluated with the sinusoid switched off.
             args += [
                 "use_rlt=True",
-                f"rlt_threshold={g('rlt_threshold', 0.3)}",
+                f"rlt_threshold={g('rlt_threshold', 0.05)}",
                 f"rlt_temporal_pos_scale={g('rlt_temporal_pos_scale', 0.0)}",
             ]
         return ",".join(args)

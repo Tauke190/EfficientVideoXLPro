@@ -366,6 +366,9 @@ class LlavaMetaForCausalLM(ABC):
                 patch_size=getattr(self.config, "rlt_patch_size", 14),
                 max_frames=getattr(self.config, "rlt_max_frames", 512),
                 temporal_pos_scale=getattr(self.config, "rlt_temporal_pos_scale", 1.0),
+                attn_mode=getattr(self.config, "rlt_attn_mode", "reuse"),
+                mask_mode=getattr(self.config, "rlt_mask_mode", "ref"),
+                refresh_every=getattr(self.config, "rlt_refresh_every", 0),
             )
             # NB: no blanket .to(device/dtype) here. The module aliases the
             # already-placed vision tower; temporal_pos is placed on-device inside
@@ -386,7 +389,8 @@ class LlavaMetaForCausalLM(ABC):
         features = []
         total_keep = total_dense = 0
         for i, frames in enumerate(per_clip_frames):
-            survivors, mask_flat = rlt(frames)                     # (N, mm_hidden)
+            dense, mask_flat = rlt(frames)                         # (T, P, C), (T*P,)
+            survivors = dense.reshape(-1, dense.shape[-1])[mask_flat]   # (N, C)
             n_keep, n_dense = int(mask_flat.sum()), int(mask_flat.numel())
             total_keep += n_keep
             total_dense += n_dense
@@ -407,38 +411,6 @@ class LlavaMetaForCausalLM(ABC):
         self._rlt_grand_videos = getattr(self, "_rlt_grand_videos", 0) + len(per_clip_frames)
         return features
 
-    def _rlt_scatter_back(self, survivors, mask_flat, T, P):
-        """Reconstruct a dense (T, P, C) grid from RLT survivors by forward-fill.
-
-        RLT drops a patch token when it is (near-)identical to the same patch in
-        the previous frame, so a dropped slot is *defined* as "carry the previous
-        survivor forward". We place survivors at their kept (t,h,w) slots and fill
-        every dropped slot with the most recent kept survivor at that spatial
-        position. RLT always keeps the whole first frame (its dummy first-frame
-        rule), so every position has a valid fill at t=0.
-
-        Args:
-            survivors: (N, C) encoded survivors in (t,h,w) frame-major order.
-            mask_flat: (T*P,) bool keep-mask in the same (t,h,w) order.
-            T: frames in the clip. P: patch tokens per frame (SigLIP grid).
-
-        Returns:
-            (T, P, C) dense feature grid, matching one clip's vision_tower output.
-        """
-        C = survivors.shape[-1]
-        dev = survivors.device
-        dense = survivors.new_zeros(T * P, C)
-        dense[mask_flat] = survivors
-        dense = dense.view(T, P, C)
-
-        mask2d = mask_flat.view(T, P)
-        t_idx = torch.arange(T, device=dev).view(T, 1).expand(T, P)
-        # Index of the most recent kept frame at or before t (running max of kept t).
-        kept_t = torch.where(mask2d, t_idx, torch.full_like(t_idx, -1))
-        last_kept = torch.cummax(kept_t, dim=0).values.clamp(min=0)        # (T, P)
-        gather_idx = last_kept.unsqueeze(-1).expand(T, P, C)
-        return torch.gather(dense, 0, gather_idx)
-
     def encode_clips_rlt_dense(self, videos_or_images, split_sizes):
         """RLT-encode each clip cheaply, then forward-fill to a dense grid.
 
@@ -455,13 +427,19 @@ class LlavaMetaForCausalLM(ABC):
         dense_clips = []
         total_keep = total_dense = 0
         for i, frames in enumerate(per_clip_frames):
-            T = frames.shape[0]
-            survivors, mask_flat = rlt(frames)                             # (N, C), (T*P,)
-            P = mask_flat.numel() // T
+            # The RLT module already returns the forward-filled dense grid: under
+            # attn_mode="reuse" the carries ARE the encoder state, so there is nothing
+            # left to scatter back here.
+            dense, mask_flat = rlt(frames)                                 # (T, P, C)
             n_keep, n_dense = int(mask_flat.sum()), int(mask_flat.numel())
             total_keep += n_keep
             total_dense += n_dense
-            dense_clips.append(self._rlt_scatter_back(survivors, mask_flat, T, P))
+            dense_clips.append(dense)
+        rank0_print(
+            f"[RLT+DTS] mode={rlt.attn_mode} threshold={rlt.threshold} "
+            f"encoder tokens kept={total_keep}/{total_dense} "
+            f"({100.0 * total_keep / max(total_dense, 1):.1f}% kept); DTS compresses the dense grid next."
+        )
         # Keep the grand-total counters live so the eval harness summary still works.
         self._rlt_grand_keep = getattr(self, "_rlt_grand_keep", 0) + total_keep
         self._rlt_grand_dense = getattr(self, "_rlt_grand_dense", 0) + total_dense
