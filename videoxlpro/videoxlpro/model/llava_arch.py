@@ -579,6 +579,49 @@ class LlavaMetaForCausalLM(ABC):
         )
         return tuple(dense_clips)
 
+    @staticmethod
+    def _dist_ready():
+        return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+    @classmethod
+    def _sync_max_int(cls, value, device):
+        """Global max of a per-rank integer. Identity when not distributed.
+
+        Used to align DATA-dependent call counts of ZeRO-3-partitioned modules across
+        ranks -- see the note in encode_multimodals.
+        """
+        if not cls._dist_ready():
+            return int(value)
+        t = torch.tensor([int(value)], device=device, dtype=torch.long)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+        return int(t.item())
+
+    @classmethod
+    def _check_rank_invariant(cls, value, what, device):
+        """Raise loudly if `value` is not identical on every rank.
+
+        A per-rank difference in how many times a partitioned module is called is not a
+        recoverable condition -- it desyncs the ZeRO-3 all-gather sequence and the job
+        deadlocks until ddp_timeout with an uninformative ALLGATHER_BASE timeout. Better
+        to die immediately, naming the rank and the value, than to hang for hours.
+        """
+        if not cls._dist_ready():
+            return int(value)
+        rank = torch.distributed.get_rank()
+        t = torch.tensor([int(value), -int(value)], device=device, dtype=torch.long)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+        vmax, vmin = int(t[0].item()), -int(t[1].item())
+        if vmax != vmin:
+            msg = (
+                f"[ZeRO-3 desync guard] rank {rank}: {what} is not rank-invariant "
+                f"(this rank={int(value)}, global min={vmin}, max={vmax}). Each rank would "
+                f"issue a different number of all-gathers, desyncing the collective sequence "
+                f"and deadlocking the job until ddp_timeout. Failing fast instead."
+            )
+            print(msg, flush=True)
+            raise RuntimeError(msg)
+        return int(value)
+
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
         #################################################################################
         # if videos_or_images.shape[0] > 360:
@@ -647,8 +690,33 @@ class LlavaMetaForCausalLM(ABC):
 
             per_videos_or_images_features = torch.split(videos_or_images_features, split_sizes, dim=0)  # tuple, (dim_1, 576, 4096)
         all_videos_or_images_features = []
-        
-        
+
+        # ---- ZeRO-3 collective-sequence invariance --------------------------------
+        # sae and mm_projector are ZeRO-3-PARTITIONED modules: every call to one issues
+        # an all-gather of its shards. DeepSpeed requires all ranks to issue the same
+        # all-gathers in the same order; a rank that calls a partitioned module a
+        # different number of times desyncs the sequence, and the job then deadlocks
+        # until ddp_timeout with a bare ALLGATHER_BASE watchdog timeout naming neither
+        # the rank nor the cause (observed on job 351066, hanging at step ~3204 -- and
+        # deterministically at the SAME step on rerun, because it is the fixed shuffle
+        # order that decides which sample lands on which rank).
+        #
+        # Two counts here are DATA-dependent, and both must be pinned:
+        #   * the loop below runs once per clip and calls sae + mm_projector each pass,
+        #   * the sae chunk loop ran once for bc//4 <= 24 but ceil((bc//4)/24) times
+        #     above it -- so an image whose anyres tiling yields >24 crops (the
+        #     image_grid_pinpoints here reach 49 tiles, and process_images ignores the
+        #     "_4" in anyres_max_4, so nothing caps the crop count) issues EXTRA
+        #     all-gathers versus a peer rank holding an ordinary image or a 32-frame
+        #     video (both of which land at bc//4 <= 24 -> exactly one call).
+        #
+        # The clip count is checked (a mismatch is unrecoverable -- fail fast and name
+        # the rank rather than hang for hours); the chunk count is padded up to the
+        # global max with dummy calls, the same fix already applied to patch_attn in
+        # siglip_apt_embeddings._embed.
+        _dev = videos_or_images.device
+        self._check_rank_invariant(len(per_videos_or_images_features), "clip count (len(split_sizes))", _dev)
+
         for idx, feat in enumerate(per_videos_or_images_features):
             #print(feat.shape,end='1\n')
             feat=self.interpolate(feat)
@@ -659,21 +727,37 @@ class LlavaMetaForCausalLM(ABC):
                 feat=self.add_image(feat)
 
             bc,ch,h,w=feat.shape
-            
+
             feat = feat.view(bc//4,ch,4,h,w)
             if getattr(self.config, 'use_sae', True):
-                if bc//4>24:
-                    chunk_size = 24
-                    chunks = torch.split(feat, chunk_size, dim=0)
-                    interpolated_chunks = []
-                    for chunk in chunks:
-                        interpolated_chunk=self.get_model().sae(chunk).squeeze(2)
-                        interpolated_chunks.append(interpolated_chunk)
-                    feat = torch.cat(interpolated_chunks, dim=0)
-                    del interpolated_chunks
-                    del chunks
-                else:
-                    feat=self.get_model().sae(feat).squeeze(2)
+                # torch.split gives a single chunk when bc//4 <= 24, so this one loop
+                # reproduces both of the old branches exactly -- minus their divergent
+                # call counts.
+                chunk_size = 24
+                chunks = list(torch.split(feat, chunk_size, dim=0))
+                n_chunks = self._sync_max_int(len(chunks), _dev)
+                interpolated_chunks = []
+                dummy_acc = None
+                for i in range(n_chunks):
+                    if i < len(chunks):
+                        interpolated_chunks.append(self.get_model().sae(chunks[i]).squeeze(2))
+                    else:
+                        # Padding call: exists solely so this rank's all-gather count
+                        # matches the peer that had more chunks.
+                        d = self.get_model().sae(chunks[0][:1]).squeeze(2)
+                        dummy_acc = d if dummy_acc is None else dummy_acc + d
+                feat = torch.cat(interpolated_chunks, dim=0) if len(interpolated_chunks) > 1 else interpolated_chunks[0]
+                if dummy_acc is not None:
+                    # Fold the padding call into the graph with weight 0: numerically a
+                    # no-op, but it keeps sae reachable from the loss on this rank. Without
+                    # it, a forward with no corresponding backward would leave sae's grad
+                    # hooks unfired whenever sae is TRAINABLE (mm_tunable_parts=
+                    # mm_temporal_compressor), desyncing the gradient reduce-scatter and
+                    # reintroducing the very deadlock this block exists to prevent.
+                    feat = feat + 0.0 * dummy_acc.sum()
+                del interpolated_chunks
+                del dummy_acc
+                del chunks
             else:
                 feat = feat.view(bc, ch, h, w)
 
