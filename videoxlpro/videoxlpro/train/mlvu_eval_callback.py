@@ -137,8 +137,10 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
         force-assigns EVERY one of these onto the loaded config after from_pretrained,
         falling back to its own defaults for anything absent from --model_args. So an
         omitted knob is not inherited from the checkpoint -- it is silently replaced,
-        and eval measures a model training never produced. rlt_threshold is the live
-        trap: the wrapper defaults to 0.1, training to 0.3.
+        and eval measures a model training never produced. rlt_threshold used to be the
+        live trap (wrapper defaulted to 0.1, training to 0.3); every default is now 0.2,
+        so an omitted knob degrades to the trained value instead of a different one. It
+        must still travel explicitly -- the agreement is a backstop, not a guarantee.
         """
         cfg = self._trainer.model.config
         g = lambda name, default=None: getattr(cfg, name, default)
@@ -149,6 +151,15 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
             f"attn_implementation={self._trainer.args.attn_implementation}",
             f"use_sae={g('use_sae', True)}",
         ]
+        # Encoder-side knobs shared by RLT and APT-Temporal. They MUST travel: the wrapper
+        # defaults to reuse/ref, so an ablation that trains with per_frame/consec would
+        # otherwise be evaluated with the fixed encoder -- the exact silent train/eval
+        # divergence this method's docstring warns about.
+        if g("use_rlt", False) or g("use_apt_temporal", False):
+            args += [
+                f"rlt_attn_mode={g('rlt_attn_mode', 'reuse')}",
+                f"rlt_mask_mode={g('rlt_mask_mode', 'ref')}",
+            ]
         # lmms_eval splits --model_args on commas, so threshold lists travel colon-separated.
         thresholds = ":".join(str(t) for t in (g("apt_thresholds") or []))
         if g("use_apt", False):
@@ -164,8 +175,7 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
                 f"apt_threshold={thresholds}",
                 f"apt_num_scales={g('apt_num_scales', 3)}",
                 f"apt_input_res={g('apt_input_res', 392)}",
-                f"rlt_threshold={g('rlt_threshold', 0.3)}",
-                f"apt_temporal_majority_ratio={g('apt_temporal_majority_ratio', 0.5)}",
+                f"rlt_threshold={g('rlt_threshold', 0.2)}",
                 f"apt_temporal_max_frames={g('apt_temporal_max_frames', 512)}",
             ]
         elif g("use_rlt", False):
@@ -175,7 +185,7 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
             # path needs >0) would otherwise be evaluated with the sinusoid switched off.
             args += [
                 "use_rlt=True",
-                f"rlt_threshold={g('rlt_threshold', 0.05)}",
+                f"rlt_threshold={g('rlt_threshold', 0.2)}",
                 f"rlt_temporal_pos_scale={g('rlt_temporal_pos_scale', 0.0)}",
             ]
         return ",".join(args)

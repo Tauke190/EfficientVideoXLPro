@@ -7,20 +7,28 @@ each method is directly comparable at matched frame counts. All variants run in 
 process by mutating model.config between them (the RLT/APT paths dispatch purely on
 config flags at runtime), so the model is loaded only once.
 
+Each variant is measured over --num_videos DISTINCT videos sampled from --video_dir
+(same seeded sample for every variant). That is the axis that matters: what a remover
+saves depends on the footage -- a static surveillance shot lets APT-Temporal reuse
+almost everything, a moving camera lets it reuse nothing -- so repeating one clip just
+measures that clip precisely. The report shows the median plus the min-max range.
+
 Usage:
     python scripts/profile_encoder.py \
         --model MINT-SJTU/Video-XL-Pro-3B \
-        --video /mnt/SSD2/huggingface/mlvu_test/test_surveil_27.mp4 \
+        --video_dir /mnt/SSD2/huggingface/mlvu_test \
+        --num_videos 5 \
         --frames 64 128 256 \
-        --methods original rlt apt \
-        --sae both \
-        --warmup 1 \
-        --runs 3
+        --methods original rlt apt apt_temporal \
+        --sae on \
+        --warmup 2
 """
 
 import sys
 import os
 import time
+import glob
+import random
 import argparse
 import statistics
 
@@ -95,15 +103,19 @@ def _install_encoder_timer(model, _enc):
     """Time just the SigLIP transformer stack (the 'pure encoder'), isolated from the
     projector/pool/token-scatter that prepare_inputs_labels_for_multimodal also does.
 
-    Brackets the encoder layer list that ALL paths share: the original path runs it
-    via SiglipVisionModel.forward, while RLT/APT iterate the same vm.encoder.layers
-    directly -- so a hook on encoder.layers fires in every method (a hook on the
-    vision-tower wrapper would miss RLT/APT). Pre-hook on the first layer / post-hook
-    on the last layer brackets the whole stack with just 2 syncs per forward pass, and
+    Hooks the first/last SUBMODULES inside the encoder stack, not the encoder layers
+    themselves. The layer modules look like the obvious bracket, but RLT/APT/APT-Temporal
+    never call them: their _run_encoder reimplements the layer inline to inject an
+    xformers attn_bias, reaching into layer.layer_norm1 / layer.self_attn.q_proj /
+    layer.mlp directly and so bypassing nn.Module.__call__ on the layer -- a hook there
+    fires only on the 'original' path and silently reports 0ms for every remover.
+    layer_norm1 (first op of a layer) and mlp (last op) ARE invoked via __call__ by both
+    HF's SiglipEncoderLayer.forward and by _run_encoder, so they bracket the stack in
+    every method. Excludes post_layernorm in both paths alike. 2 syncs per forward pass;
     accumulates across frame-batches. Returns hook handles to remove afterward."""
     vt = model.get_model().get_vision_tower()
     layers = vt.vision_tower.vision_model.encoder.layers
-    first, last = layers[0], layers[-1]
+    first, last = layers[0].layer_norm1, layers[-1].mlp
 
     def pre(_mod, _args):
         torch.cuda.synchronize()
@@ -130,6 +142,29 @@ METHOD_FLAGS = {
 }
 
 
+VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
+
+
+def resolve_videos(args):
+    """The sampling axis is N DISTINCT videos, not N repeats of one video.
+
+    Every number here is content-dependent: APT's partition is driven by frame entropy,
+    and RLT/APT-Temporal's savings by how much actually moves. Repeating one clip
+    measures that clip's quirks with tight error bars -- a static surveillance shot
+    flatters the temporal methods, a hand-held pan destroys them -- so the spread across
+    videos IS the quantity of interest, not noise to average away. Sorted pool + fixed
+    seed, so every variant is compared on the exact same content."""
+    if args.video:                      # explicit single video wins (back-compat)
+        return [args.video]
+    pool = sorted(p for p in glob.glob(os.path.join(args.video_dir, "*"))
+                  if p.lower().endswith(VIDEO_EXTS))
+    assert pool, f"no videos ({'/'.join(VIDEO_EXTS)}) under {args.video_dir}"
+    n = min(args.num_videos, len(pool))
+    if n < args.num_videos:
+        print(f"[warn] asked for {args.num_videos} videos, {args.video_dir} only has {n}")
+    return random.Random(args.video_seed).sample(pool, n)
+
+
 def variant_label(method, use_sae):
     return f"{method} | sae={'on' if use_sae else 'off'}"
 
@@ -146,7 +181,17 @@ def apply_variant(model, method, use_sae, args):
 
     # Method params (harmless to set even when the method is off). APT wants one
     # threshold per non-base scale (apt_num_scales - 1); a single value broadcasts.
-    cfg.rlt_threshold = args.rlt_threshold
+    # The rlt_* knobs below are shared, not RLT-only: APT-Temporal's dirty-tile check
+    # runs on the same SigLIP-normalized pixel scale RLT does, so it reads the same
+    # rlt_threshold / rlt_mask_mode / rlt_refresh_every / rlt_attn_mode fields (see
+    # llava_arch._get_apt_temporal_module). Set them explicitly rather than leaning on
+    # the getattr fallbacks in llava_arch, whose rlt_temporal_pos_scale default (1.0)
+    # differs from the eval loader's (0.0) -- profiled configs must match eval configs.
+    cfg.rlt_threshold          = args.rlt_threshold
+    cfg.rlt_temporal_pos_scale = args.rlt_temporal_pos_scale
+    cfg.rlt_attn_mode          = args.rlt_attn_mode
+    cfg.rlt_mask_mode          = args.rlt_mask_mode
+    cfg.rlt_refresh_every      = int(args.rlt_refresh_every)
     thr = [float(p) for p in str(args.apt_threshold).replace(",", ":").split(":") if p != ""]
     n_needed = int(args.apt_num_scales) - 1
     if len(thr) == 1:
@@ -155,26 +200,53 @@ def apply_variant(model, method, use_sae, args):
     cfg.apt_thresholds = thr
     cfg.apt_num_scales = args.apt_num_scales
     cfg.apt_input_res  = args.apt_input_res
-    cfg.apt_temporal_majority_ratio = args.apt_temporal_majority_ratio
     cfg.apt_temporal_max_frames     = args.apt_temporal_max_frames
 
-    # Reset the model's running token-drop tallies so we can report % kept for
-    # just this variant (they otherwise accumulate across every clip ever seen).
+
+def reset_tallies(model):
+    """Zero the model's running token-drop counters. Called after warmup, so kept%/miss%
+    cover exactly the measured videos (they otherwise accumulate across every clip the
+    model has ever seen, warmup included)."""
     for attr in ("_rlt_grand_keep", "_rlt_grand_dense",
-                 "_apt_grand_keep", "_apt_grand_dense"):
+                 "_apt_grand_keep", "_apt_grand_dense",
+                 "_apt_temporal_grand_keep", "_apt_temporal_grand_dense"):
         if hasattr(model, attr):
             setattr(model, attr, 0)
+    # APT-Temporal also accumulates its cell-classification diagnostics (missed_reuse
+    # et al.) as a running sum + count; reset both or the rate is smeared across variants.
+    if hasattr(model, "_apt_temporal_stat_sum"):
+        model._apt_temporal_stat_sum = {}
+        model._apt_temporal_stat_n = 0
+
+
+# Per-method prefix of the model's grand-total token tallies (llava_arch sets
+# _{prefix}_grand_keep / _grand_dense on every encode). "original" has no remover
+# and therefore no tallies.
+RETENTION_PREFIX = {"rlt": "_rlt", "apt": "_apt", "apt_temporal": "_apt_temporal"}
 
 
 def read_retention(model, method):
     """% of dense tokens the remover kept during this variant (None if N/A)."""
-    if method == "rlt":
-        keep, dense = getattr(model, "_rlt_grand_keep", 0), getattr(model, "_rlt_grand_dense", 0)
-    elif method == "apt":
-        keep, dense = getattr(model, "_apt_grand_keep", 0), getattr(model, "_apt_grand_dense", 0)
-    else:
+    prefix = RETENTION_PREFIX.get(method)
+    if prefix is None:
         return None
+    keep = getattr(model, f"{prefix}_grand_keep", 0)
+    dense = getattr(model, f"{prefix}_grand_dense", 0)
     return (100.0 * keep / dense) if dense else None
+
+
+def read_missed_reuse(model, method):
+    """APT-Temporal only: % of base cells that were unchanged but still had to pay for
+    a fresh token because the quadtree partition wobbled between frames. This is pure
+    loss and the ceiling on what TAPT can save over plain APT, so it is the number that
+    explains a disappointing kept% (partition instability, not the classifier)."""
+    if method != "apt_temporal":
+        return None
+    stat_sum = getattr(model, "_apt_temporal_stat_sum", None) or {}
+    n = getattr(model, "_apt_temporal_stat_n", 0)
+    if not n or "missed_reuse" not in stat_sum:
+        return None
+    return 100.0 * stat_sum["missed_reuse"] / n
 
 
 def run_one(model, tokenizer, image_processor, video_path, max_frames, device, use_sae):
@@ -237,21 +309,30 @@ def _med(vals):
     return statistics.median(vals) if vals else 0.0
 
 
-def print_report(all_results, frames_list, variants):
-    """One comparison table per frame count. Columns:
+def print_report(all_results, frames_list, variants, videos):
+    """One comparison table per frame count. Every cell is a MEDIAN over the
+    (videos x runs) samples; siglip carries a min-max range because content, not
+    noise, drives the spread. Columns:
       siglip - pure SigLIP transformer stack. ~Flat across sae on/off within a method
                (SAE is post-encoder); shrinks for RLT/APT (fewer tokens attended).
+      range  - min-max of siglip across the sampled videos. A wide range on a temporal
+               method (RLT/APT-Temporal) is the headline result, not measurement noise:
+               it is the method's sensitivity to how much the footage actually moves.
       spd    - siglip speedup vs the 'original | sae=on' baseline (encoder gain).
-      kept%  - fraction of dense tokens the remover kept (RLT/APT only).
+      kept%  - fraction of dense tokens the remover kept, pooled over all videos
+               (RLT/APT/APT-temporal only).
+      miss%  - APT-temporal only: unchanged base cells that still cost a fresh token
+               because the partition wobbled. The ceiling on TAPT's savings, so read
+               it alongside kept%: a high miss% means partition instability.
       prep   - full multimodal prep = siglip + SAE + projector + pool + token scatter.
                This is the column that grows ~4x when SAE is OFF (4x more tokens
                through projector/pool/scatter), even though siglip itself is flat.
       llm    - generation over the resulting sequence (also ~4x longer w/o SAE)."""
-    header = (f"{'config':<22}  {'siglip':>8}  {'spd':>5}  {'kept%':>6}  "
+    header = (f"{'config':<22}  {'siglip':>8}  {'range':>13}  {'spd':>5}  {'kept%':>6}  {'miss%':>6}  "
               f"{'prep':>8}  {'llm':>9}  {'ttft':>9}  {'total':>9}")
     for frames in frames_list:
         print()
-        print(f"=== frames={frames} ===")
+        print(f"=== frames={frames}  (median over {len(videos)} video(s) x runs) ===")
         print(header)
         print("-" * len(header))
         base_key = (variant_label("original", True), frames)
@@ -268,29 +349,56 @@ def print_report(all_results, frames_list, variants):
             spd = f"{base_sig / sig:.2f}x" if (base_sig and sig) else "-"
             kept = runs[0].get("kept_pct")
             kept_s = f"{kept:.1f}" if kept is not None else "-"
-            print(f"{label:<22}  {sig:>6.0f}ms  {spd:>5}  {kept_s:>6}  "
+            miss = runs[0].get("missed_reuse_pct")
+            miss_s = f"{miss:.1f}" if miss is not None else "-"
+            sigs = [r["siglip_ms"] for r in runs]
+            rng_s = f"{min(sigs):.0f}-{max(sigs):.0f}ms" if len(sigs) > 1 else "-"
+            print(f"{label:<22}  {sig:>6.0f}ms  {rng_s:>13}  {spd:>5}  {kept_s:>6}  {miss_s:>6}  "
                   f"{prep:>6.0f}ms  {llm:>7.0f}ms  {tf:>7.0f}ms  {tt:>7.0f}ms")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Profile Video-XL-Pro encoder vs LLM across variants")
     parser.add_argument("--model",   default="MINT-SJTU/Video-XL-Pro-3B")
-    parser.add_argument("--video",   default="/mnt/SSD2/huggingface/mlvu_test/test_surveil_27.mp4")
+    # Sample N distinct videos (default) instead of hammering one clip: the encoder gain
+    # of every remover is content-dependent, so one video measures one video.
+    parser.add_argument("--video_dir", default="/mnt/SSD2/huggingface/mlvu_test",
+                        help="Pool to sample --num_videos from (ignored if --video is given)")
+    parser.add_argument("--num_videos", type=int, default=5,
+                        help="How many distinct videos to profile each variant on")
+    parser.add_argument("--video_seed", type=int, default=0,
+                        help="Seed for the video sample; fixed so every variant sees the same set")
+    parser.add_argument("--video",   default=None,
+                        help="Profile this single video instead of sampling --video_dir")
     parser.add_argument("--frames",  nargs="+", type=int, default=[64, 128, 256])
-    parser.add_argument("--methods", nargs="+", default=["original", "rlt", "apt"],
+    parser.add_argument("--methods", nargs="+",
+                        default=["original", "rlt", "apt", "apt_temporal"],
                         choices=list(METHOD_FLAGS.keys()),
                         help="Pre-encoder redundancy removers to compare")
     parser.add_argument("--sae", choices=["on", "off", "both"], default="both",
                         help="SAE/DTS temporal compression: on, off, or sweep both")
+    # Shared by RLT and APT-Temporal (both ask "did this patch change vs. the frame it
+    # would be reused from?" on the same pixel scale), so one knob drives both methods.
     parser.add_argument("--rlt_threshold", type=float, default=0.1)
+    parser.add_argument("--rlt_temporal_pos_scale", type=float, default=0.0,
+                        help="RLT survivor temporal sinusoid gain. Keep 0.0 with SAE on "
+                             "(SAE already carries temporal info); >0 only for the ragged path.")
+    parser.add_argument("--rlt_attn_mode", choices=["reuse", "per_frame"], default="reuse",
+                        help="'reuse' = survivors attend over the full frame; 'per_frame' = legacy starved attention")
+    parser.add_argument("--rlt_mask_mode", choices=["ref", "consec"], default="ref",
+                        help="Dirty-check reference frame: 'ref' (bounds drift) or 'consec' (legacy)")
+    parser.add_argument("--rlt_refresh_every", type=int, default=0,
+                        help="ref mode only: force-refresh every Nth frame (0 disables)")
     parser.add_argument("--apt_threshold", default="4.0",
                         help="Colon-separated per-scale thresholds, e.g. 4.0:6.0 (single value broadcasts)")
     parser.add_argument("--apt_num_scales", type=int, default=3)
     parser.add_argument("--apt_input_res",  type=int, default=392)
-    parser.add_argument("--apt_temporal_majority_ratio", type=float, default=0.5)
     parser.add_argument("--apt_temporal_max_frames",     type=int,   default=512)
-    parser.add_argument("--warmup",  type=int, default=1)
-    parser.add_argument("--runs",    type=int, default=3)
+    parser.add_argument("--warmup",  type=int, default=1,
+                        help="Warmup passes (first video, excluded from timings and tallies)")
+    parser.add_argument("--runs",    type=int, default=1,
+                        help="Repeats PER VIDEO. The sample axis is --num_videos; raise this "
+                             "only to average out timing jitter within a single clip.")
     parser.add_argument("--hf_home", default="/mnt/SSD2/huggingface")
     args = parser.parse_args()
 
@@ -299,6 +407,11 @@ def main():
 
     sae_states = {"on": [True], "off": [False], "both": [True, False]}[args.sae]
     variants = [(variant_label(m, s), m, s) for m in args.methods for s in sae_states]
+
+    videos = resolve_videos(args)
+    print(f"Profiling {len(videos)} video(s):")
+    for v in videos:
+        print(f"  {v}")
 
     print(f"Loading {args.model} ...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -320,23 +433,40 @@ def main():
     for label, method, use_sae in variants:
         print(f"\n########## {label} ##########")
         for max_frames in args.frames:
-            apply_variant(model, method, use_sae, args)  # reset retention tally per (variant, frames)
+            apply_variant(model, method, use_sae, args)
             print(f"  frames={max_frames}")
+
+            # Warmup on the first video only (it pays the one-time CUDA/cuDNN autotune
+            # and the lazy build of the RLT/APT/TAPT module), then zero the tallies so
+            # kept%/miss% describe exactly the measured videos.
+            for i in range(args.warmup):
+                print(f"    warmup {i + 1} ...", end=" ", flush=True)
+                r = run_one(model, tokenizer, image_processor, videos[0], max_frames, device, use_sae)
+                print(f"total={r['total_ms']:.0f}ms")
+            reset_tallies(model)
+
             runs = []
-            for i in range(args.warmup + args.runs):
-                tag = "warmup" if i < args.warmup else f"run {i - args.warmup + 1}"
-                print(f"    {tag} ...", end=" ", flush=True)
-                r = run_one(model, tokenizer, image_processor, args.video, max_frames, device, use_sae)
-                print(f"total={r['total_ms']:.0f}ms  siglip={r['siglip_ms']:.0f}ms  "
-                      f"prep={r['prep_ms']:.0f}ms  llm={r['llm_ms']:.0f}ms  ttft={r['ttft_ms']:.0f}ms")
-                if i >= args.warmup:
+            for vi, video in enumerate(videos):
+                for i in range(args.runs):
+                    tag = f"vid {vi + 1}/{len(videos)} {os.path.basename(video)[:28]}"
+                    tag += f" run {i + 1}" if args.runs > 1 else ""
+                    print(f"    {tag} ...", end=" ", flush=True)
+                    r = run_one(model, tokenizer, image_processor, video, max_frames, device, use_sae)
+                    print(f"total={r['total_ms']:.0f}ms  siglip={r['siglip_ms']:.0f}ms  "
+                          f"prep={r['prep_ms']:.0f}ms  llm={r['llm_ms']:.0f}ms  ttft={r['ttft_ms']:.0f}ms")
+                    r["video"] = video
                     runs.append(r)
+
+            # Tallies are grand totals over every measured video, so kept%/miss% are
+            # pooled rates rather than one clip's -- attach the same value to each run.
             kept = read_retention(model, method)
+            miss = read_missed_reuse(model, method)
             for r in runs:
                 r["kept_pct"] = kept
+                r["missed_reuse_pct"] = miss
             all_results[(label, max_frames)] = runs
 
-    print_report(all_results, args.frames, variants)
+    print_report(all_results, args.frames, variants, videos)
 
 
 if __name__ == "__main__":

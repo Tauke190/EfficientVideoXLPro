@@ -81,9 +81,9 @@ _ENC_DIR = os.path.join(
 sys.path.insert(0, _ENC_DIR)
 from apt_static_tokens import compute_patch_entropy_batched, select_patches_by_threshold  # noqa: E402
 from apt_temporal_static_tokens import (  # noqa: E402
-    REDUNDANT, FRESH, OVERRIDE,
+    REDUNDANT, FRESH,
     dense_scale_code_grid, dirty_subtile_mask, shape_match_grid,
-    cell_dirty_stats, classify_cells,
+    cell_all_quiet, classify_cells,
 )
 
 # Per-scale overlay colors in RGB (finest -> coarsest).
@@ -95,14 +95,16 @@ DEFAULT_COLORS = [
 ]
 
 # APT-Temporal classification tint colors (RGB), drawn as a translucent fill
-# under the scale-color outlines -- REDUNDANT: dim gray (no compute this
-# frame); FRESH: no tint (normal); OVERRIDE: bright magenta highlight
-# (merge-overridden -- minority of sub-tiles changed, still collapsed).
-TAPT_TINTS = {
-    REDUNDANT: (80, 80, 80),
-    FRESH: None,
-    OVERRIDE: (255, 0, 220),
-}
+# under the scale-color outlines.
+#   REDUNDANT     -- dim gray: carried forward from the last event, no compute.
+#   FRESH         -- no tint: content genuinely changed, re-embedded (as it should be).
+#   MISSED_REUSE  -- bright magenta: the cell did NOT change at all, but its quadtree
+#                    boundaries disagree with the previous frame's, so there is no token
+#                    of the right shape to carry forward and it pays for a full token
+#                    anyway. Pure loss to PARTITION INSTABILITY -- these are the cells
+#                    threshold hysteresis / windowed re-partitioning would recover.
+TAPT_TINT_REDUNDANT = (80, 80, 80)
+TAPT_TINT_MISSED = (255, 0, 220)
 
 
 def parse_args():
@@ -123,13 +125,19 @@ def parse_args():
                    help="Entropy thresholds, one per non-base scale (len = num_scales-1).")
     # APT-Temporal (TAPT) overlay
     p.add_argument("--temporal", action="store_true",
-                   help="Also classify each cell REDUNDANT/FRESH/OVERRIDE vs. the previous "
-                        "frame (see apt_temporal_static_tokens.py) and tint the overlay.")
+                   help="Also classify each cell REDUNDANT/FRESH vs. the previous frame (see "
+                        "apt_temporal_static_tokens.py) and tint the overlay, highlighting "
+                        "cells that did not change but still cost a token (missed reuse).")
     p.add_argument("--pixel_threshold", type=float, default=12.0,
                    help="0-255-scale mean-abs pixel L1 vs. the previous frame (TAPT dirty signal).")
-    p.add_argument("--majority_ratio", type=float, default=0.5,
-                   help="Fraction of dirty sub-tiles above which a shape-mismatched cell is "
-                        "independent (FRESH) rather than merge-overridden (OVERRIDE).")
+    p.add_argument("--mask_mode", type=str, default="ref", choices=["ref", "consec"],
+                   help="TAPT dirty-check mode: 'ref' (default, matches config.rlt_mask_mode's "
+                        "default) diffs each tile against the reference it would actually be "
+                        "carried forward from, bounding drift regardless of run length; 'consec' "
+                        "is the legacy per-frame-t-1 diff, which lets slow drift accumulate "
+                        "unboundedly across a long REDUNDANT run.")
+    p.add_argument("--refresh_every", type=int, default=0,
+                   help="ref mode only: force-refresh every Nth frame regardless of drift. 0 disables.")
     # rendering
     p.add_argument("--canvas", type=int, default=784, help="Output frame size (square); patches scaled to match.")
     p.add_argument("--thickness", type=int, default=1, help="Patch outline thickness.")
@@ -175,16 +183,20 @@ def compute_partition(frame_rgb, image_size, patch_size, num_scales, thresholds,
 
 
 def compute_temporal_classification(sq_frames, patch_sizes, base_patch_size, num_scales,
-                                     thresholds, pixel_threshold, majority_ratio, device):
-    """Classify every base cell of every sampled frame as REDUNDANT/FRESH/OVERRIDE
-    vs. the previous frame (see apt_temporal_static_tokens.py). Fully vectorized
-    across the whole sampled sequence -- same primitives the encoder uses, so
-    what's rendered is what SiglipAPTTemporalEmbeddings would actually do.
+                                     thresholds, pixel_threshold, device,
+                                     mask_mode="ref", refresh_every=0):
+    """Classify every base cell of every sampled frame as REDUNDANT/FRESH vs. the
+    previous frame (see apt_temporal_static_tokens.py). Fully vectorized across the
+    whole sampled sequence -- same primitives the encoder uses, so what's rendered is
+    what SiglipAPTTemporalEmbeddings would actually do.
 
     sq_frames: list of (image_size, image_size, 3) uint8 RGB arrays (already
         resized to the APT processing grid by the per-frame compute_partition
         calls in main()).
-    Returns (T, G, G) numpy long array.
+
+    Returns (cls, missed), both (T, G, G) numpy arrays. `missed` marks cells that are
+    all-quiet (nothing changed) but shape-mismatched, so they cannot be carried forward
+    and cost a full token for no reason -- the partition-instability tax.
     """
     stacked = np.stack(sq_frames, axis=0)                                 # (T,H,W,3) uint8
     t = torch.from_numpy(stacked).to(device).permute(0, 3, 1, 2).float()  # (T,3,H,W) in [0,255]
@@ -192,19 +204,21 @@ def compute_temporal_classification(sq_frames, patch_sizes, base_patch_size, num
     masks = select_patches_by_threshold(maps, thresholds=thresholds)
 
     scale_grid = dense_scale_code_grid(masks, patch_sizes, base_patch_size)
-    dirty = dirty_subtile_mask(t, pixel_threshold, base_patch_size)
+    dirty = dirty_subtile_mask(t, pixel_threshold, base_patch_size,
+                                mask_mode=mask_mode, refresh_every=refresh_every)
     shape_match = shape_match_grid(scale_grid, masks, patch_sizes, base_patch_size)
-    all_quiet, majority_dirty = cell_dirty_stats(
-        dirty, masks, patch_sizes, base_patch_size, majority_ratio
-    )
-    cls = classify_cells(shape_match, all_quiet, majority_dirty)
-    return cls.detach().cpu().numpy()
+    all_quiet = cell_all_quiet(dirty, masks, patch_sizes, base_patch_size)
+    cls = classify_cells(shape_match, all_quiet)
+    missed = (~shape_match) & all_quiet
+    missed[0] = False                       # frame 0 has no predecessor; nothing was "missed"
+    return cls.detach().cpu().numpy(), missed.detach().cpu().numpy()
 
 
-def draw_temporal_tint(disp, cls_frame, base_patch_size, proc, canvas, alpha=0.35):
-    """Alpha-blend a translucent per-base-cell tint onto `disp` according to
-    this frame's REDUNDANT/FRESH/OVERRIDE classification. Drawn BEFORE the
-    scale-color outlines in draw_overlay so those remain crisp on top."""
+def draw_temporal_tint(disp, cls_frame, missed_frame, base_patch_size, proc, canvas, alpha=0.35):
+    """Alpha-blend a translucent per-base-cell tint onto `disp`: gray where the cell was
+    carried forward (REDUNDANT), magenta where it did not change yet still cost a token
+    (missed reuse), untinted where it genuinely changed. Drawn BEFORE the scale-color
+    outlines in draw_overlay so those remain crisp on top."""
     scale = canvas / proc
     side = int(round(base_patch_size * scale))
     G = cls_frame.shape[0]
@@ -212,8 +226,11 @@ def draw_temporal_tint(disp, cls_frame, base_patch_size, proc, canvas, alpha=0.3
     any_tint = False
     for i in range(G):
         for j in range(G):
-            color = TAPT_TINTS.get(int(cls_frame[i, j]))
-            if color is None:
+            if int(cls_frame[i, j]) == REDUNDANT:
+                color = TAPT_TINT_REDUNDANT
+            elif missed_frame is not None and bool(missed_frame[i, j]):
+                color = TAPT_TINT_MISSED
+            else:
                 continue
             any_tint = True
             x1, y1 = int(round(j * side)), int(round(i * side))
@@ -224,19 +241,19 @@ def draw_temporal_tint(disp, cls_frame, base_patch_size, proc, canvas, alpha=0.3
 
 
 def draw_overlay(sq_rgb, masks, patch_sizes, colors, thickness, canvas, ts, thresholds,
-                  cls_frame=None, base_patch_size=None):
+                  cls_frame=None, missed_frame=None, base_patch_size=None):
     """Draw color-coded adaptive patches + stats onto an upscaled canvas (RGB).
 
-    cls_frame (optional): (G,G) REDUNDANT/FRESH/OVERRIDE classification for
-    this frame vs. the previous one (see compute_temporal_classification) --
-    tinted underneath the scale-color outlines when provided.
+    cls_frame (optional): (G,G) REDUNDANT/FRESH classification for this frame vs. the
+    previous one (see compute_temporal_classification) -- tinted underneath the
+    scale-color outlines when provided, along with missed_frame (quiet but unreusable).
     """
     proc = sq_rgb.shape[0]
     scale = canvas / proc
     disp = cv2.resize(sq_rgb, (canvas, canvas), interpolation=cv2.INTER_LINEAR)
 
     if cls_frame is not None:
-        disp = draw_temporal_tint(disp, cls_frame, base_patch_size, proc, canvas)
+        disp = draw_temporal_tint(disp, cls_frame, missed_frame, base_patch_size, proc, canvas)
 
     counts = {}
     dense = (proc // patch_sizes[0]) ** 2
@@ -260,8 +277,10 @@ def draw_overlay(sq_rgb, masks, patch_sizes, colors, thickness, canvas, ts, thre
     if cls_frame is not None:
         n_redundant = int((cls_frame == REDUNDANT).sum())
         n_fresh = int((cls_frame == FRESH).sum())
-        n_override = int((cls_frame == OVERRIDE).sum())
-        lines.append(f"TAPT: redundant={n_redundant} fresh={n_fresh} override={n_override}")
+        n_missed = int(missed_frame.sum()) if missed_frame is not None else 0
+        lines.append(
+            f"TAPT: redundant={n_redundant} fresh={n_fresh} (missed_reuse={n_missed})"
+        )
     y = 22
     for ln in lines:
         cv2.putText(disp, ln, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
@@ -275,14 +294,14 @@ def draw_overlay(sq_rgb, masks, patch_sizes, colors, thickness, canvas, ts, thre
         cv2.putText(disp, txt, (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         y += 22
     if cls_frame is not None:
-        cv2.rectangle(disp, (8, y - 12), (24, y + 2), TAPT_TINTS[OVERRIDE], -1)
-        cv2.putText(disp, "OVERRIDE (merged anyway)", (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(disp, "OVERRIDE (merged anyway)", (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        y += 22
-        cv2.rectangle(disp, (8, y - 12), (24, y + 2), TAPT_TINTS[REDUNDANT], -1)
-        cv2.putText(disp, "REDUNDANT (no compute)", (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(disp, "REDUNDANT (no compute)", (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        y += 22
+        for color, txt in (
+            (TAPT_TINT_REDUNDANT, "REDUNDANT (reused, no compute)"),
+            (TAPT_TINT_MISSED, "MISSED REUSE (unchanged, paid anyway)"),
+        ):
+            cv2.rectangle(disp, (8, y - 12), (24, y + 2), color, -1)
+            cv2.putText(disp, txt, (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(disp, txt, (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            y += 22
     return disp, survivors, dense
 
 
@@ -317,28 +336,37 @@ def main():
         sq_frames.append(sq)
         per_frame_masks.append(masks)
 
-    cls = None
+    cls = missed = None
     if args.temporal:
         # Pass 2 (temporal, needs the whole sequence at once): classify every
-        # base cell of every frame REDUNDANT/FRESH/OVERRIDE vs. the previous one.
-        cls = compute_temporal_classification(
+        # base cell of every frame REDUNDANT/FRESH vs. the previous one.
+        cls, missed = compute_temporal_classification(
             sq_frames, patch_sizes, args.patch_size, args.num_scales, args.thresholds,
-            args.pixel_threshold, args.majority_ratio, args.device,
+            args.pixel_threshold, args.device,
+            mask_mode=args.mask_mode, refresh_every=args.refresh_every,
         )
         n_redundant = int((cls == REDUNDANT).sum())
         n_fresh = int((cls == FRESH).sum())
-        n_override = int((cls == OVERRIDE).sum())
+        n_missed = int(missed.sum())
         n_total = cls.size
         print(f"[TAPT] classification over {len(frames)} frames: "
-              f"redundant={n_redundant}/{n_total} ({100*n_redundant/n_total:.1f}%, no compute needed) "
-              f"fresh={n_fresh} override={n_override}")
+              f"redundant={n_redundant}/{n_total} ({100*n_redundant/n_total:.1f}%, reused -- the saving) "
+              f"fresh={n_fresh}")
+        # The diagnostic that matters: cells that did NOT change but still cost a token,
+        # because the quadtree redrew its boundaries between frames. Recovering these is
+        # a partition-stability problem (threshold hysteresis / windowed re-partitioning),
+        # not a classification one.
+        print(f"[TAPT] MISSED REUSE: {n_missed}/{n_total} ({100*n_missed/n_total:.1f}%) cells "
+              f"were unchanged but unreusable (partition instability). Ceiling on reuse is "
+              f"{100*(n_redundant + n_missed)/n_total:.1f}% if the partition were stable.")
 
     grand_keep = grand_dense = 0
     for k, (sq, masks, ts) in enumerate(zip(sq_frames, per_frame_masks, timestamps)):
         cls_frame = cls[k] if cls is not None else None
+        missed_frame = missed[k] if missed is not None else None
         disp, keep, dense = draw_overlay(
             sq, masks, patch_sizes, colors, args.thickness, args.canvas, ts, args.thresholds,
-            cls_frame=cls_frame, base_patch_size=args.patch_size,
+            cls_frame=cls_frame, missed_frame=missed_frame, base_patch_size=args.patch_size,
         )
         grand_keep += keep
         grand_dense += dense

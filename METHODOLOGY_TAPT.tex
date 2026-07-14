@@ -1,0 +1,404 @@
+% =====================================================================
+% Methodology section: TAPT (Temporally-Anchored Adaptive Patch Tokenization)
+% Combines APT (arXiv 2510.18091) spatial quadtree patchification with
+% RLT (arXiv 2411.05222) temporal run-length collapsing, at the SigLIP
+% embedding seam of Video-XL-Pro-3B.
+% =====================================================================
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Preliminaries and Notation}
+\label{sec:prelim}
+
+We build on \textbf{Video-XL-Pro-3B}, whose visual pathway encodes each frame
+independently with a frozen SigLIP-so400m-patch14-384 tower, resamples the
+resulting per-frame grid to $24\times24=576$ tokens, compresses groups of four
+consecutive frames into one with a learned temporal compressor (the DTS/SAE
+stack, two $3\!\times\!3\!\times\!3$ convolutions of temporal stride $2$
+interleaved with spatio-temporal attention), projects to the language space with
+an MLP adapter, and finally applies a $2\times2$ spatial pool before the tokens
+enter the LLM.
+
+The cost bottleneck sits \emph{before} any of this. The SigLIP encoder is run
+densely: every one of the $T$ frames is patchified into $P$ tokens and pushed
+through all $L$ transformer blocks, at a cost of $\mathcal{O}(T \cdot L \cdot
+P^2)$ attention and $\mathcal{O}(T \cdot L \cdot P)$ position-wise work,
+\emph{regardless of how much of the video is actually new information}. Long
+egocentric video is exactly the regime where that assumption is worst: most of
+the frame is spatially flat, and most of what is not flat is temporally static.
+
+Let a clip be $\mathbf{X} = \{x_1, \dots, x_T\}$, $x_t \in
+\mathbb{R}^{3 \times H \times W}$. We run the visual front-end at $H=W=392$ with
+base patch size $p=14$, giving a base grid of $G = 392/14 = 28$ and $P = G^2 =
+784$ base cells per frame.\footnote{SigLIP's native $384$px input induces a
+$27\times27$ grid, which is odd and therefore admits no clean $2\times$/$4\times$
+quadtree. Running at $392$px yields $28 = 4\cdot 7$, divisible by both merge
+factors, at the cost of a single one-time interpolation of SigLIP's learned
+position embedding from $27\times27$ to $28\times28$.} We index base cells by
+$(i,j) \in [G]\times[G]$. We write $E(\cdot)$ for SigLIP's frozen patch-embedding
+convolution, which is only ever shown a native $p \times p$ patch, and $\pi$ for
+SigLIP's learned position embedding.
+
+Two orthogonal forms of redundancy exist in $\mathbf{X}$, and prior work attacks
+exactly one each:
+
+\begin{itemize}
+  \item \textbf{Spatial redundancy} (within a frame). \emph{Adaptive Patch
+    Transformers} (APT) \cite{apt} replaces the uniform patch grid with a
+    content-adaptive quadtree: low-entropy regions are merged into coarse
+    tokens, detailed regions stay at base resolution.
+  \item \textbf{Temporal redundancy} (across frames). \emph{Run-Length
+    Tokenization} (RLT) \cite{rlt} drops any patch whose pixels have not changed
+    since the previous frame, and tags each survivor with the run length it
+    stands in for.
+\end{itemize}
+
+Neither subsumes the other. A blue-sky region is spatially redundant but, under
+a moving camera, may be temporally fresh; a cluttered bookshelf is spatially
+incompressible but, under a static camera, entirely stale. Applied alone, each
+method leaves the other axis' savings on the table. Our method, \textbf{TAPT}
+(\emph{Temporally-Anchored Adaptive Patch Tokenization}), resolves both axes in a
+single tokenizer.
+
+\subsection{Spatial Axis: Entropy-Driven Quadtree Partition}
+\label{sec:apt}
+
+Following APT, each frame is patchified independently at $|\mathcal{S}|$ scales
+$\mathcal{S} = \{p, 2p, 4p\} = \{14, 28, 56\}$. For each scale $s$ we compute a
+per-patch Shannon entropy map from the $512$-bin grayscale intensity histogram of
+the (un-normalized) patch,
+\begin{equation}
+  e^{(s)}_t(u,v) \;=\; -\sum_{b=1}^{512} q_b \log_2 q_b ,
+  \qquad q_b = \tfrac{1}{s^2}\big|\{\text{pixels in patch } (u,v) \text{ in bin } b\}\big| ,
+\end{equation}
+and select patches top-down: a coarse patch at scale $s$ survives iff
+$e^{(s)}_t < \tau_s$, and every finer patch it covers is then masked out. With
+per-scale thresholds $\bm{\tau} = (4.0, 6.0)$ this yields per-frame masks
+$M^{(s)}_t \in \{0,1\}^{G/s \times G/s}$ that form a \textbf{strict spatial
+partition} of the base grid --- exhaustive and disjoint, so every base cell is
+covered by exactly one surviving patch. We summarize the partition by a dense
+\emph{scale-code map} $c_t(i,j) \in \{1,\dots,|\mathcal{S}|\}$ recording which
+scale covers each base cell.
+
+A coarse token is not a mean-pool of its children. It is built with APT's merge
+operator (their Eq.~2), re-pointed onto SigLIP's own frozen modules:
+\begin{equation}
+  \label{eq:apt-merge}
+  E(P_i) \;=\; \underbrace{\mathrm{ZeroMLP}\Big(\mathrm{Conv}^{\,i}\big(\{\,E(P_j) \mid P_j \subset P_i\,\}\big)\Big)}_{\text{sub-patch detail (trainable)}}
+  \;+\; \underbrace{E\big(\mathrm{Resize}_p(P_i)\big)}_{\text{coarse pixel anchor (frozen)}} \;+\; \pi_s(P_i),
+\end{equation}
+where $\mathrm{Conv}^{\,i}$ is a single trainable strided $2\!\times\!2$
+convolution applied $i$ times over the grid of constituent sub-patch embeddings,
+$\mathrm{ZeroMLP}$ is a zero-initialized linear layer, and $\pi_s$ is SigLIP's
+position embedding resampled from the base grid to the coarse grid. The
+zero-initialization is what makes this safe to bolt onto a pretrained checkpoint:
+at initialization every coarse token is \emph{exactly} $E(\mathrm{Resize}_p(P_i))
++ \pi_s$, a plain downsampled patch embedding, so the merge perturbs the
+pretrained model by nothing and a short fine-tune folds the sub-patch detail back
+in. We preserve this property exactly under TAPT (\S\ref{sec:tapt-token}).
+
+\subsection{Temporal Axis: Reference-Anchored Change Detection}
+\label{sec:rlt}
+
+RLT's primitive is a per-patch \emph{dirty} test on raw pixels: a base tile is
+kept iff its mean absolute intensity change exceeds a threshold, and the first
+frame is always kept. We reuse this primitive unchanged, at $\text{tubelet}=1$
+(SigLIP is a 2D encoder, so a token is one frame deep) and on the same
+SigLIP-normalized pixel scale, which lets a single threshold $\tau_{\text{rlt}}$
+serve both methods rather than two differently-scaled knobs for the same
+question:
+\begin{equation}
+  \label{eq:dirty}
+  d_t(i,j) \;=\; \mathbb{1}\!\left[\;\tfrac{1}{3p^2}\!\!\sum_{\text{pixels} \in (i,j)}\!\! \big| x_t - x_{r} \big| \;>\; \tau_{\text{rlt}} \right],
+  \qquad d_1(i,j) = 1 \;\; \forall (i,j).
+\end{equation}
+
+\paragraph{Reference-anchored diffing.}
+We depart from the reference RLT implementation in the choice of $x_r$. RLT tests
+$|x_t - x_{t-1}|$ but, having dropped a token, later \emph{reuses} it from
+$x_{t_0}$, the last frame at which it survived --- and $t_0$ may be many frames
+back. The condition tested is therefore not the condition relied upon. A patch
+drifting slowly (say $0.01$ per frame) never trips the consecutive-frame test,
+yet after $15$ frames it has moved $0.15$ away from the frame whose features it
+is actually carrying; the error is unbounded and grows with run length. We
+instead set $x_r = x_{t_0}$: each patch is compared against the reference it
+would actually reuse, and that reference is refreshed only where the patch
+survives. Drift is then bounded by $\tau_{\text{rlt}}$ \emph{by construction}.
+This distinction is invisible on the fixed-camera benchmarks RLT was validated on
+(Kinetics, SSv2) and fires hard on egocentric, moving-camera video, where slow
+global drift is the norm --- precisely our target regime. As
+\S\ref{sec:attention} shows, it is also what makes carried keys/values sound in
+the first place: the two are one interlocking argument, not two tricks.
+
+\subsection{TAPT: Composing the Two Axes}
+\label{sec:tapt}
+
+The two axes cannot simply be run in sequence, because they disagree. APT gives
+frame $t$ its own independent partition; frame $t-1$ has a \emph{different} one.
+A token can only be carried forward from $t-1$ if the cell it would fill at $t$
+exists, at the same scale and the same boundary, in $t-1$'s partition too. TAPT
+is the rule that reconciles them.
+
+\paragraph{Precedence: spatial first, temporal second.}
+Every frame is first partitioned independently by the entropy quadtree of
+\S\ref{sec:apt} (batched across the whole clip; the entropy and threshold ops are
+already per-frame with no cross-frame mixing). Temporal redundancy is then
+resolved \emph{on top of} that partition, per base cell, comparing frame $t$
+against frame $t-1$. Fixing this order --- rather than collapsing time first and
+partitioning the survivors --- keeps each frame's tokens interpretable as a
+partition of that frame, which both the scatter-back and the SigLIP attention
+depend on.
+
+\paragraph{The reuse rule.}
+For each base cell we compute two predicates, both keyed to \textbf{frame $t$'s
+own cell footprint} $\mathcal{C}_t(i,j)$ (the set of base cells covered by the
+surviving patch that contains $(i,j)$ in frame $t$'s partition):
+\begin{align}
+  \sigma_t(i,j) &= \mathbb{1}\big[\, c_{t-1} \text{ is uniformly equal to } c_t(i,j) \text{ over } \mathcal{C}_t(i,j) \,\big] && \text{(\emph{shape match})} \\
+  a_t(i,j) &= \mathbb{1}\Big[\textstyle\sum_{(i',j') \in \mathcal{C}_t(i,j)} d_t(i',j') = 0\Big] && \text{(\emph{all quiet})}
+\end{align}
+and classify with a single conjunction (frame $1$ is forced \textsc{Fresh},
+having no predecessor):
+\begin{equation}
+  \label{eq:classify}
+  z_t(i,j) \;=\;
+  \begin{cases}
+    \textsc{Redundant} & \sigma_t \wedge a_t \quad\text{--- emit \emph{no token}; carry $t-1$'s forward} \\[2pt]
+    \textsc{Fresh}     & \text{otherwise} \quad\;\;\, \text{--- re-embed at frame $t$'s own scale}
+  \end{cases}
+\end{equation}
+
+Because APT's masks are a grid-aligned quadtree, a \emph{uniform} scale code
+across an aligned footprint \emph{is} the same cell, so $\sigma_t$ reduces to a
+min/max-pool uniformity check and needs no per-cell loop. Keying $a_t$ to frame
+$t$'s own footprint (rather than $t-1$'s) is load-bearing: when frame $t$ merges a
+region that frame $t-1$ had split into several differently-scaled sub-cells,
+aggregating per $t-1$'s heterogeneous structure would assign \emph{different}
+decisions to sub-tiles of what is, at $t$, a single cell --- which are all
+supposed to become one token. Keying both predicates to $\mathcal{C}_t$ makes
+uniformity within a cell true by construction.
+
+Both conditions are necessary, and neither implies the other. Condition
+$\sigma_t$ alone is insufficient because a cell can keep its shape while its
+content changes entirely. Condition $a_t$ alone is insufficient for a subtler
+reason: when the shapes disagree there is simply \emph{nothing to carry}. Frame
+$t$ wants one $2p$ token; frame $t-1$ only ever produced four $p$ tokens over
+that region. No token of the right shape exists at $t-1$, so reuse is not an
+option \emph{even when the pixels are identical}. Finally, note that $a_t$ also
+catches what pure spatial entropy cannot see on its own: a region can be
+spatially uniform within a frame (low local variance $\Rightarrow$ ``safe to
+merge'') while having changed completely since the previous frame, e.g.\ a flat
+wall whose illumination shifts. The temporal signal overrides the spatial merge
+decision there.
+
+\paragraph{Token construction.}
+\label{sec:tapt-token}
+Let $\varepsilon_t = \mathbb{1}[z_t = \textsc{Fresh}]$ mark \emph{token events},
+and let
+\begin{equation}
+  \bar{o}_t(i,j) \;=\; \max\{\,t' \le t : \varepsilon_{t'}(i,j)\,\}
+\end{equation}
+be the carry index: which token event supplies cell $(i,j)$'s value at frame $t$.
+It is computed as a running $\mathrm{cummax}$ over the frame axis and is
+well-defined because frame $1$ is always \textsc{Fresh}. The frozen patch conv is
+evaluated only on tiles belonging to \textsc{Fresh} cells --- once per position
+per change, not once per position per frame --- giving base-tile embeddings
+$\tilde{e}_t(i,j) = E(x_t[(i,j)]) + \pi(i,j)$. A token emitted at event
+$(t,(i,j))$ occupying a cell of scale $s$ is then
+\begin{equation}
+  \label{eq:tapt-token}
+  h_t(i,j) \;=\;
+  \mathrm{ZeroMLP}\Big(\mathrm{Conv}^{\,i}\big(\{\tilde{e}_t(i',j')\}_{(i',j') \in \mathcal{C}_t}\big)\Big)
+  \;+\; E\big(\mathrm{Resize}_p(P)\big)
+  \;+\; \pi_s
+  \;+\; \psi\big(\ell_t(i,j)\big),
+\end{equation}
+degenerating to $h_t = \tilde{e}_t + \psi(\ell_t)$ at the base scale $s=p$.
+
+Equation~\ref{eq:tapt-token} is \textbf{APT's merge (Eq.~\ref{eq:apt-merge})
+verbatim}, plus one additive term. This is a deliberate design constraint, not an
+accident: because every coarse token still carries the frozen pixel anchor
+$E(\mathrm{Resize}_p)$, and $\mathrm{ZeroMLP}$ and $\psi$ are both
+zero-initialized, \emph{every} TAPT token at step $0$ equals exactly what plain
+APT would produce. TAPT is an identity perturbation of the pretrained model at
+initialization, and the fine-tune only ever adds to it. We assert this
+value-for-value as a unit invariant.
+
+\paragraph{Run-length tagging.}
+$\ell_t(i,j)$ is the run length assigned at each token event --- the number of
+frames until the next event at that spatial position --- and $\psi$ is a
+zero-initialized learnable embedding table. RLT reports that its learnable
+run-length encoding $\phi_L$ contributes little, and we likewise omit it from our
+RLT baseline. Under TAPT it is reinstated, because the situation is materially
+different: TAPT's survivors stand in for regions of \emph{heterogeneous spatial
+scale}, so a token carries a genuinely variable amount of staleness, and
+$\psi(\ell)$ is the signal that tells the encoder how much.
+
+\paragraph{Partition-complete attention.}
+\label{sec:attention}
+Once tokens are dropped, one must decide what the survivors attend \emph{to}, and
+the naive answer is wrong. Give each frame an attention block containing only its
+own token events, and a frame whose scene barely changed runs all $L$ SigLIP
+blocks as a handful-of-tokens sequence, when the weights were trained to expect a
+whole frame. Worse, the error is \emph{anti-correlated with difficulty}: the more
+redundant the frame, the more context is deleted.
+
+The fix follows from a structural fact about a transformer layer: every operation
+except attention is \emph{position-wise}. A token therefore plays two independent
+roles --- as a \emph{query} it determines only its own output, but as a
+\emph{key/value} it is shared context for everyone else. Temporal redundancy is a
+statement about the first role only: ``this patch of wall did not change'' means
+\emph{its output need not be recomputed}, not that the wall stopped being part of
+the scene. Conflating the two is the bug.
+
+We therefore keep the queries as the token events only (so cost still scales with
+the event rate), while the keys/values span the frame's \textbf{full partition}:
+fresh events plus the tokens carried from their last event, i.e.\ the
+deduplicated row set $\{\,\bar{o}_t(i,j) : (i,j) \in [G]^2\,\}$. Deduplication is
+essential --- a coarse token spans many base cells and must enter the key set
+\emph{once}, or its attention mass would scale with its area and the construction
+would not reduce to APT. Carrying a dropped token's $k/v$ is sound because
+$k = W_k\,\mathrm{LN}(x)$ is position-wise, so carrying the hidden state forward
+and carrying $k/v$ forward are the same operation; and it is \emph{accurate at
+layer $0$ by construction} precisely because of the reference-anchored dirty test
+of \S\ref{sec:rlt}, which bounds $\|x^{(0)}_{t,j} - x^{(0)}_{t_0,j}\|$ by
+$\tau_{\text{rlt}}$ against the very frame being reused. The residual error --- a
+static patch's deep representation would, in the dense model, have absorbed some
+context from its \emph{changed} neighbours --- is self-limiting: staleness scales
+with how much the frame changed, while the \emph{number} of stale keys scales
+inversely. Deletion has exactly the opposite structure. The scales also always
+line up: a cell is \textsc{Redundant} only when $\sigma_t$ holds, so by
+transitivity along the carry chain the carried token has precisely the scale and
+boundary the cell needs.
+
+Position-wise work (the $q/k/v$/out projections and the MLPs, $\approx\!90\%$ of
+the encoder's FLOPs) therefore stays $\mathcal{O}(N)$ in the number of events $N$;
+attention costs $\mathcal{O}(N \cdot |\text{partition}|)$ rather than the dense
+$\mathcal{O}(T \cdot P^2)$. \textbf{TAPT reduces exactly to plain per-frame APT
+when nothing is reused}, and to dense SigLIP when additionally nothing is merged;
+we verify both numerically as unit invariants.
+
+\paragraph{Scatter-back.}
+The encoded survivors are broadcast back to a dense grid via $\bar{o}$,
+\begin{equation}
+  F_t(i,j) \;=\; \hat{h}\big[\,\bar{o}_t(i,j)\,\big] \;\in\; \mathbb{R}^{T \times P \times C},
+\end{equation}
+a coarse token filling every base cell it covers and a redundant cell taking the
+value of whichever event last refreshed its position. Because the masks are a
+strict partition and $\bar{o}$ is total, every base cell is written exactly once.
+This keeps TAPT a \emph{drop-in replacement for the SigLIP tower alone}: the
+entire downstream Video-XL-Pro pipeline (resample $\rightarrow$ DTS/SAE temporal
+compression $\rightarrow$ MLP projector $\rightarrow$ 2D pool $\rightarrow$ LLM)
+runs unchanged, and TAPT's encoder-side savings \emph{compose} with DTS's
+$4\times$ temporal compression rather than competing with it.
+
+\subsection{The Ceiling: Partition Stability}
+\label{sec:missed}
+
+Equation~\ref{eq:classify} makes the limit on TAPT's savings explicit, and it is
+worth stating plainly because it is not where one would expect. Reuse requires
+$\sigma_t \wedge a_t$. Consider the cells where $\neg\sigma_t \wedge a_t$: the
+region \emph{did not change at all}, yet the quadtree redrew its boundaries
+between frames --- typically because an entropy value jittered across a threshold
+$\tau_s$ with no underlying content change --- and so no token of the right shape
+exists to carry forward and the cell pays for a full re-encode anyway. We call
+this \textbf{missed reuse}, and it is pure loss.
+
+Crucially, missed reuse is \emph{not} a classification problem, and no
+elaboration of Eq.~\ref{eq:classify} can recover it: the token that would be
+reused does not exist. It is a \textbf{partition-stability} problem. We therefore
+instrument it directly, reporting $\Pr[\neg\sigma_t \wedge a_t]$ alongside the
+keep rate; the quantity $\Pr[a_t]$ is the reuse rate TAPT would achieve if the
+partition were temporally stable, and the gap between it and $\Pr[\sigma_t \wedge
+a_t]$ is what a stability mechanism (threshold hysteresis, or re-partitioning once
+per window rather than per frame) stands to recover. \emph{[Report the measured
+figures here; see \S\ref{sec:training} for the instrumentation.]}
+
+\subsection{Training}
+\label{sec:training}
+
+We start from the released Video-XL-Pro-3B checkpoint and skip the pretraining
+stage entirely; TAPT is introduced by a single short fine-tune.
+
+\paragraph{What trains.}
+The SigLIP patch embedder $E$ and the entropy tokenizer are frozen (the latter has
+no parameters at all). TAPT's own parameters are the merge convolution
+$\mathrm{Conv}^{\,i}$, the merge projection $\mathrm{ZeroMLP}$, and the run-length
+table $\psi$ --- a negligible fraction of the 3B backbone. These are owned by the
+base model rather than by the tokenizer wrapper, so they appear in
+\texttt{named\_parameters()} and are picked up by the optimizer, the ZeRO-3
+partitioner, and the checkpoint saver. Alongside them we unfreeze the visual
+pathway that must re-align to the perturbed features: the vision tower, the MLP
+adapter, and the DTS/SAE temporal compressor. The LLM stays frozen, so the
+fine-tune cannot launder a token-reduction regression into recovered VQA ability.
+
+\paragraph{Zero-initialization as an identity guarantee.}
+Both $\mathrm{ZeroMLP}$ (weight \emph{and} bias) and $\psi$ are zero-initialized,
+and every coarse token retains the frozen pixel anchor $E(\mathrm{Resize}_p)$
+(Eq.~\ref{eq:tapt-token}). At step $0$, therefore, TAPT's output is
+\emph{identical} to plain APT's, and the model is exactly the pretrained one
+modulo the token reduction itself. Fine-tuning is precisely the process of
+folding the sub-patch detail and the staleness signal back in. This is what makes
+the run interpretable: we measure whether the model learns to invert a known
+distortion, starting from a state where it does not attempt to.
+
+\paragraph{Threshold consistency.}
+$\tau_{\text{rlt}}$ controls how much temporal reuse happens, and hence how much
+distortion there is to compensate \emph{for}. It must therefore be identical at
+train and eval time: training at one reuse rate and evaluating at another teaches
+the model to invert the wrong distortion. We fix $\tau_{\text{rlt}} = 0.2$,
+$\bm{\tau} = (4.0, 6.0)$ and $|\mathcal{S}| = 3$ throughout. TAPT introduces no
+hyperparameter of its own beyond those already present in APT and RLT.
+
+\paragraph{Optimization.}
+Fine-tuning runs for one epoch on a mixture of Ego4D video and LLaVA-665K image
+data, at $32$ frames per clip sampled at $1$ fps, with AdamW at learning rate
+$1\text{e-}5$ (cosine schedule, $3\%$ warmup, no weight decay), bf16, DeepSpeed
+ZeRO-3, and FlashAttention-2 in the LLM. We evaluate on MLVU at a $128$-frame
+budget, both as an in-training callback at every checkpoint and as a final
+lmms-eval run. The encoder additionally logs the classification rates of
+\S\ref{sec:missed} ($\sigma_t$, $a_t$, their conjunction, and missed reuse) per
+clip.
+
+% ---------------------------------------------------------------------
+% Figure
+% ---------------------------------------------------------------------
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figures/tapt_overview}
+  \caption{%
+    \textbf{TAPT resolves spatial and temporal redundancy in one tokenizer.}
+    \emph{(Left)} Each frame is partitioned independently by APT's entropy-driven
+    quadtree, merging low-entropy regions into coarse ($2p$, $4p$) patches and
+    leaving detailed regions at base resolution $p$; the partition is strict, so
+    every base cell is covered exactly once.
+    \emph{(Centre)} Temporal redundancy is resolved \emph{on top of} that
+    partition. The two frames' partitions disagree in general, so a cell can be
+    carried forward only if \emph{both} tests pass: its shape must exist at the
+    same scale and boundary in frame $t\!-\!1$'s partition (\emph{shape match}),
+    \emph{and} nothing inside it may have changed (RLT's pixel \emph{dirty} test,
+    anchored to the frame the token would actually be reused from, which bounds
+    drift by the threshold rather than letting it accumulate). Cells passing both
+    are \textsc{Redundant} and emit no token at all; every other cell is
+    \textsc{Fresh} and is re-embedded at frame $t$'s own scale, exactly as plain
+    APT would. Both tests are load-bearing: shape match alone misses content that
+    changed in place, and quiet-pixels alone is not enough because when the
+    boundaries disagree there is simply no token of the right shape at $t\!-\!1$
+    to carry --- the case highlighted in magenta, where a region that \emph{did
+    not change} still costs a full token because the quadtree wobbled across an
+    entropy threshold. That \emph{missed reuse} is the ceiling on TAPT's savings,
+    and it is a partition-stability problem rather than a classification one.
+    \emph{(Right)} Only the token events are packed and pushed through the frozen
+    SigLIP blocks. They attend as queries over their frame's \emph{full}
+    partition --- fresh events plus carried tokens supplying keys/values --- so no
+    frame is starved of context, which is sound because every operation but
+    attention is position-wise. Encoded survivors are scattered back to a dense
+    $(T, P, C)$ grid via the carry index, leaving the rest of Video-XL-Pro
+    (DTS/SAE, projector, LLM) untouched. Trainable parameters (orange) are
+    zero-initialized and every coarse token retains its frozen pixel anchor, so at
+    step $0$ TAPT is \emph{exactly} plain APT --- an identity perturbation of the
+    pretrained model.%
+  }
+  \label{fig:tapt}
+\end{figure}

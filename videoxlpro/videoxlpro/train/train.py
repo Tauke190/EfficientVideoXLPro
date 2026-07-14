@@ -113,7 +113,7 @@ class ModelArguments:
     # survivor-only encoder path and trains the learnable run-length encoding phi_L.
     use_rlt: bool = field(default=False)
     use_sae: bool = field(default=True, metadata={"help": "Scatter RLT survivors back to a dense grid and run DTS/SAE (composed). Off => legacy ragged RLT-only."})
-    rlt_threshold: float = field(default=0.3, metadata={"help": "Mean abs pixel-change threshold for dropping temporally-redundant tokens."})
+    rlt_threshold: float = field(default=0.2, metadata={"help": "Mean abs pixel-change threshold for dropping temporally-redundant tokens. 0.2 everywhere (train, eval wrapper, encoder, eval callback): it sets how much reuse happens, hence how much distortion there is to compensate for, so a train/eval mismatch teaches the model to invert the wrong distortion."})
     rlt_max_frames: int = field(default=512)
     rlt_patch_size: int = field(default=14)
     rlt_attn_mode: str = field(default="reuse", metadata={"help": "How survivors attend inside SigLIP. 'reuse' (default): survivors attend over the full P-token frame, with dropped tokens supplying the keys/values they carry from their last surviving copy -- reduces to dense SigLIP at 100% keep. 'per_frame' (legacy): survivors attend ONLY to each other, starving them of their own frame's context. Kept for ablation."})
@@ -145,7 +145,6 @@ class ModelArguments:
     # pixel scale, answering the identical question ("did this patch change vs.
     # the previous frame?"), so it's one shared knob, not two.
     use_apt_temporal: bool = field(default=False)
-    apt_temporal_majority_ratio: float = field(default=0.5, metadata={"help": "Fraction of dirty sub-tiles above which a shape-mismatched cell is treated as independent (FRESH) rather than merge-overridden (OVERRIDE)."})
     apt_temporal_max_frames: int = field(default=512, metadata={"help": "Size of the APT-Temporal run-length embedding table."})
 
 
@@ -326,9 +325,9 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         # APT-Temporal's own run-length embedding still needs including, though.
         if getattr(trainer.model.config, "use_apt_temporal", False):
             keys_to_match.append("apt_temporal_reuse_embed")
-        # Same reasoning for APT's patch_attn/zero_conv -- also trainable (and
-        # so also needs saving) under use_apt_temporal, since OVERRIDE events
-        # depend on them alone (see siglip_apt_temporal_embeddings.py).
+        # Same reasoning for APT's patch_attn/zero_conv -- also trainable (and so
+        # also needs saving) under use_apt_temporal, whose coarse tokens are APT's
+        # Eq. 2 verbatim (see siglip_apt_temporal_embeddings.py).
         if getattr(trainer.model.config, "use_apt", False) or getattr(trainer.model.config, "use_apt_temporal", False):
             keys_to_match.extend(["apt_patch_attn", "apt_zero_conv"])
 
@@ -1847,7 +1846,6 @@ def train(attn_implementation=None):
         # is config.rlt_threshold (set above) -- deliberately shared with RLT,
         # not a separate apt_temporal_* field (see ModelArguments comment).
         model.config.use_apt_temporal = model_args.use_apt_temporal
-        model.config.apt_temporal_majority_ratio = model_args.apt_temporal_majority_ratio
         model.config.apt_temporal_max_frames = model_args.apt_temporal_max_frames
 
         ### Deciding train which part of the model
@@ -1920,10 +1918,10 @@ def train(attn_implementation=None):
         # compensation for the quadtree merge (paper arXiv 2510.18091 Eq. 2). Same
         # reasoning as RLT's phi_L above -- keep them trainable whenever APT is
         # enabled, regardless of which other parts mm_tunable_parts covers.
-        # Also required for use_apt_temporal: OVERRIDE events (see
-        # siglip_apt_temporal_embeddings.py) skip the E(Resize_p) pixel anchor
-        # and rely on patch_attn/zero_conv alone, so they can no longer be left
-        # untrained in that path either.
+        # Equally required for use_apt_temporal, whose coarse tokens ARE APT's
+        # Eq. 2, unchanged (see siglip_apt_temporal_embeddings.py): with zero_conv
+        # zero-init the merge contributes nothing until it is trained, so leaving
+        # it frozen there would permanently discard all sub-patch detail.
         if getattr(model.config, "use_apt", False) or getattr(model.config, "use_apt_temporal", False):
             apt_patch_attn = model.get_model().get_apt_patch_attn()
             apt_zero_conv = model.get_model().get_apt_zero_conv()

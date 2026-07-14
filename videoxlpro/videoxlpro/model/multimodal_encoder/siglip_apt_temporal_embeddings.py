@@ -5,7 +5,12 @@ siglip_apt_temporal_embeddings.py
 Temporal-Anchored APT (TAPT): combines APT's per-frame spatial partition with
 RLT-style temporal redundancy collapsing. See apt_temporal_static_tokens.py
 for the classification math and its docstring for the precedence rationale
-(spatial first, temporal second) and the REDUNDANT/FRESH/OVERRIDE cases.
+(spatial first, temporal second) and the REDUNDANT/FRESH rule.
+
+The reuse rule, in one line: a cell is REDUNDANT (carried forward, emitting no
+token) iff its shape matches frame t-1's partition AND nothing inside it
+changed. Otherwise it is FRESH and re-embedded at frame t's own scale, exactly
+as ordinary per-frame APT would.
 
 This module **composes** an already-built SiglipAPTEmbeddings instance --
 no changes to siglip_apt_embeddings.py are needed. It reuses:
@@ -14,24 +19,16 @@ no changes to siglip_apt_embeddings.py are needed. It reuses:
                              existing support for applying an externally
                              supplied mask to a frame's pixels, used here to
                              compute the E(Resize_p) "coarse anchor" term for
-                             just the subset of frame t's own cells that need
-                             a fresh/refreshed token this frame -- see
-                             cell_dirty_stats' docstring for why OVERRIDE
-                             always uses frame t's OWN scale/boundary, never
-                             frame t-1's: an earlier version adopted t-1's
-                             boundary and produced inconsistent classification
-                             within one of frame t's own cells whenever frame
-                             t merged a region t-1 had split into multiple,
-                             differently-scaled sub-cells).
+                             just the subset of frame t's own cells that emit a
+                             token this frame).
   * apt._embed_patches      (frozen SigLIP patch_embedding Conv2d -- never
                              shown anything but a native 14x14 patch).
-  * apt.patch_attn / apt.zero_conv  (APT's trainable, zero-init spatial merge.
-                             OVERRIDE events (see classify_cells) skip the
-                             E(Resize_p) pixel-anchor term entirely and rely
-                             on this merge alone -- see the "OVERRIDE merge"
-                             comment in forward() below -- so these must be
-                             trained whenever use_apt_temporal is on, not
-                             just use_apt; train.py wires this up).
+  * apt.patch_attn / apt.zero_conv  (APT's trainable, zero-init spatial merge,
+                             used verbatim -- every coarse token here is APT's
+                             Eq. 2 unchanged, so with zero_conv zero-init a
+                             coarse token starts at exactly E(Resize_p) + pos
+                             and TAPT is an identity perturbation of the
+                             pretrained model at step 0).
   * apt._run_encoder        (xformers block-diagonal attention over the
                              frozen SigLIP transformer layers).
   * apt.base_pos_embed / apt.base_grid_size (position embedding resampling).
@@ -52,23 +49,24 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import xformers.ops as xops
 from xformers.ops.fmha.attn_bias import BlockDiagonalMask
 from timm.layers import resample_abs_pos_embed
 
 try:
     from .siglip_apt_embeddings import SiglipAPTEmbeddings
     from .apt_temporal_static_tokens import (
-        REDUNDANT, FRESH, OVERRIDE,
+        REDUNDANT, FRESH,
         dense_scale_code_grid, dirty_subtile_mask, shape_match_grid,
-        cell_dirty_stats, classify_cells,
+        cell_all_quiet, classify_cells, classification_stats,
         compute_origin_index, compute_run_lengths,
     )
 except ImportError:  # allow running this file directly as a script for testing
     from siglip_apt_embeddings import SiglipAPTEmbeddings
     from apt_temporal_static_tokens import (
-        REDUNDANT, FRESH, OVERRIDE,
+        REDUNDANT, FRESH,
         dense_scale_code_grid, dirty_subtile_mask, shape_match_grid,
-        cell_dirty_stats, classify_cells,
+        cell_all_quiet, classify_cells, classification_stats,
         compute_origin_index, compute_run_lengths,
     )
 
@@ -80,8 +78,8 @@ def apt_temporal_scatter_back(combined_survivors: torch.Tensor, origin_index: to
     origin_index: (T, G, G) long, already fully resolved by
     SiglipAPTTemporalEmbeddings.forward -- for every (t, base cell), which row
     of combined_survivors currently supplies its value (REDUNDANT cells point
-    at whichever FRESH/OVERRIDE event most recently refreshed that spatial
-    position; FRESH/OVERRIDE cells point at their own row).
+    at whichever FRESH event most recently refreshed that spatial position;
+    FRESH cells point at their own row).
     """
     C = combined_survivors.shape[-1]
     G = origin_index.shape[-1]
@@ -107,9 +105,12 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
             answering the identical underlying question ("did this patch
             change vs. the previous frame?"), so config.rlt_threshold is
             reused directly at the llava_arch.py wiring level.
-        majority_ratio: fraction of dirty sub-tiles above which a
-            shape-mismatched cell is treated as independent (FRESH) rather
-            than merge-overridden (OVERRIDE).
+        mask_mode, refresh_every: same knobs and same "ref" default as
+            SiglipRLTEmbeddings (siglip_rlt_embeddings.py), reused directly at
+            the llava_arch.py wiring level from config.rlt_mask_mode /
+            config.rlt_refresh_every -- see dirty_subtile_mask's docstring for
+            why "ref" (diff against the carried reference, not frame t-1) is
+            the correct default for a REDUNDANT run of any length.
         max_frames: size of the run-length embedding table (a token can be
             tagged with a run-length up to max_frames-1's worth of reuse).
         reuse_len_embed: optional model-owned nn.Embedding (mirrors RLT's
@@ -117,27 +118,113 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
             -- stashed via __dict__ so this wrapper's own .to()/.cuda() can't
             clone the shared, checkpoint-tracked copy. When None, a
             standalone zero-init embedding is created (eval/testing only).
+
+    After each forward(), `self.last_stats` holds the classification diagnostics
+    for the clip just encoded (see apt_temporal_static_tokens.classification_stats);
+    `missed_reuse` there is the fraction of base cells that did not change at all
+    but still had to pay for a token because the quadtree boundaries wobbled.
     """
 
     def __init__(
         self,
         apt: SiglipAPTEmbeddings,
-        threshold: float = 0.1,
-        majority_ratio: float = 0.5,
+        threshold: float = 0.2,
         max_frames: int = 512,
         reuse_len_embed: Optional[nn.Module] = None,
+        attn_mode: str = "reuse",
+        mask_mode: str = "ref",
+        refresh_every: int = 0,
     ) -> None:
         super().__init__()
         self.apt = apt
         self.threshold = threshold
-        self.majority_ratio = majority_ratio
         self.max_frames = max_frames
+        assert attn_mode in ("reuse", "per_frame"), f"unknown attn_mode {attn_mode!r}"
+        self.attn_mode = attn_mode
+        assert mask_mode in ("ref", "consec"), f"unknown mask_mode {mask_mode!r}"
+        self.mask_mode = mask_mode
+        self.refresh_every = refresh_every
+        self.last_stats: Dict[str, float] = {}
 
         if reuse_len_embed is not None:
             self.__dict__["reuse_len_embed"] = reuse_len_embed
         else:
             self.reuse_len_embed = nn.Embedding(max_frames, apt.embed_dim)
             nn.init.zeros_(self.reuse_len_embed.weight)
+
+    def _kv_rows_per_frame(self, origin_index: torch.Tensor, events_per_frame):
+        """Per frame, the packed rows that make up its FULL partition.
+
+        origin_index[t, i, j] is the packed row covering base cell (i, j) at frame t --
+        that cell's own fresh event, or the token it carries from its last event. A coarse
+        token spans several base cells, so it appears many times in origin_index; unique()
+        collapses it back to ONE key.
+
+        That dedup is what keeps the invariant: when every cell is FRESH (nothing reused),
+        unique(origin_index[t]) is exactly frame t's APT partition, so this reduces to plain
+        APT. Gathering all G*G base cells instead would give a coarse token attention mass
+        proportional to its area and would NOT reduce to APT.
+
+        Frames with zero events contribute no queries, so their kv block is dropped too --
+        q_seqlen and kv_seqlen MUST describe the same frames, in the same order.
+
+        Returns (kv_rows concatenated frame-major, kv_seqlen, q_seqlen) over active frames.
+        """
+        rows, kv_seqlens, q_seqlens = [], [], []
+        for t, n_ev in enumerate(events_per_frame):
+            if n_ev == 0:                              # fully-redundant frame: no queries
+                continue
+            r = torch.unique(origin_index[t])          # sorted, deduped packed rows
+            rows.append(r)
+            kv_seqlens.append(int(r.numel()))
+            q_seqlens.append(int(n_ev))
+        return torch.cat(rows), kv_seqlens, q_seqlens
+
+    def _run_encoder_reuse(self, x, events_per_frame, origin_index):
+        """SigLIP encoder where each frame's events attend over its FULL partition.
+
+        Same fix as siglip_rlt_embeddings._run_encoder_reuse. The legacy path packs only the
+        EVENT tokens and gives each frame a block containing just those -- so a frame whose
+        scene barely changed encodes its handful of new tokens against almost nothing, while
+        the SigLIP weights expect a whole frame. Here the queries are still only the events
+        (so cost still scales with the event rate), but the keys/values are the frame's whole
+        partition: fresh events plus the tokens carried from their last event.
+
+        Reusing a carried token's k/v is exact whenever its content is unchanged, and the
+        scale always lines up: classify_cells only marks a cell REDUNDANT when shape_match
+        holds against t-1, so by transitivity along the carry chain the token at origin_index
+        has the same scale/boundary the cell needs at t. No resampling is possible or needed.
+        """
+        apt = self.apt
+        kv_rows, kv_seqlens, q_seqlens = self._kv_rows_per_frame(origin_index, events_per_frame)
+        assert sum(q_seqlens) == x.shape[0], (
+            f"q_seqlen total {sum(q_seqlens)} != packed events {x.shape[0]}; the packed "
+            f"sequence must be frame-major and cover exactly the event tokens."
+        )
+        attn_bias = BlockDiagonalMask.from_seqlens(q_seqlen=q_seqlens, kv_seqlen=kv_seqlens)
+
+        N, C = x.shape
+        for layer in apt.encoder_layers:
+            a = layer.self_attn
+            H, d = a.num_heads, a.head_dim
+
+            h = layer.layer_norm1(x)                                   # (N, C) events only
+            q = a.q_proj(h).view(1, N, H, d)
+            # layer_norm/k_proj/v_proj are position-wise, so projecting the packed rows and
+            # THEN gathering is identical to carrying hidden states forward and projecting.
+            k = a.k_proj(h).index_select(0, kv_rows).view(1, -1, H, d)
+            v = a.v_proj(h).index_select(0, kv_rows).view(1, -1, H, d)
+
+            o = xops.memory_efficient_attention(
+                q, k, v, attn_bias=attn_bias, scale=a.scale
+            ).reshape(N, C)
+
+            x = x + a.out_proj(o)                                      # residual, events only
+            x = x + layer.mlp(layer.layer_norm2(x))                    # MLP, events only
+
+        if getattr(apt, "apply_post_layernorm", False):
+            x = apt.post_layernorm(x)
+        return x
 
     def _resize_to_apt_input(self, pixel_values: torch.Tensor) -> torch.Tensor:
         apt = self.apt
@@ -154,8 +241,8 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
             pixel_values: (T, 3, H, W) frames for ONE clip.
 
         Returns:
-            combined_survivors: (N, C) encoded packed tokens (N <= sum over
-                scales of new-token event counts).
+            combined_survivors: (N, C) encoded packed tokens (N = number of FRESH
+                cells across the clip, summed over scales).
             origin_index: (T, G, G) long, for apt_temporal_scatter_back.
             T: frames in the clip.
             P: dense patch count per frame (G*G), matching one clip's vision
@@ -178,43 +265,43 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
         # uses -- no un-normalize step -- so self.threshold is directly the
         # shared config.rlt_threshold value, not a second differently-scaled
         # knob (see dirty_subtile_mask's docstring).
-        dirty = dirty_subtile_mask(frames.float(), self.threshold, base_p)
+        dirty = dirty_subtile_mask(frames.float(), self.threshold, base_p,
+                                    mask_mode=self.mask_mode, refresh_every=self.refresh_every)
 
         shape_match = shape_match_grid(scale_grid, masks, apt.patch_sizes, base_p)
         # Aggregated over frame t's OWN cell footprint (masks[ps][t]), not
-        # frame t-1's -- see cell_dirty_stats' docstring for why the latter
+        # frame t-1's -- see cell_all_quiet's docstring for why the latter
         # produces inconsistent classification within one of frame t's cells.
-        all_quiet, majority_dirty = cell_dirty_stats(
-            dirty, masks, apt.patch_sizes, base_p, self.majority_ratio
-        )
-        cls = classify_cells(shape_match, all_quiet, majority_dirty)
+        all_quiet = cell_all_quiet(dirty, masks, apt.patch_sizes, base_p)
+        cls = classify_cells(shape_match, all_quiet)
+        self.last_stats = classification_stats(shape_match, all_quiet)
 
-        is_new_token = cls != REDUNDANT
-        needs_fresh_embed = (cls == FRESH) | ((cls == OVERRIDE) & dirty)
-        tile_source_frame = compute_origin_index(needs_fresh_embed)
+        is_new_token = cls == FRESH                    # == (cls != REDUNDANT)
         token_origin_frame = compute_origin_index(is_new_token)
         run_length = compute_run_lengths(is_new_token)
 
-        # ---- base-tile embedding cache: E(patch)+pos, computed once per
-        # position wherever needed, gathered forward via tile_source_frame
-        # for positions that reuse an earlier frame's still-valid embedding.
+        # ---- base-tile embedding: E(patch)+pos for every tile that belongs to a
+        # FRESH cell. cls is uniform over each of frame t's own cells (shape_match
+        # and all_quiet are both keyed to masks[ps][t]), so every base tile under a
+        # FRESH cell is itself FRESH -- which means the non-FRESH slots left at zero
+        # below are never read by the merge pass. (A violation of that invariant
+        # would surface as the `origin_index >= 0` assert further down.)
         patches = frames.unfold(2, base_p, base_p).unfold(3, base_p, base_p)   # (T,3,G,G,p,p)
         patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()               # (T,G,G,3,p,p)
-        fresh_patches = patches[needs_fresh_embed].reshape(-1, 3, base_p, base_p)
-        fresh_vals = apt._embed_patches(fresh_patches)                        # (Nfresh, C)
+        fresh_vals = apt._embed_patches(
+            patches[is_new_token].reshape(-1, 3, base_p, base_p)
+        )                                                                      # (Nfresh, C)
         pos_grid = apt.base_pos_embed.to(frames.dtype).view(G, G, C)
-        pos_for_fresh = pos_grid.unsqueeze(0).expand(T, G, G, C)[needs_fresh_embed]
-        fresh_vals = fresh_vals + pos_for_fresh
+        fresh_vals = fresh_vals + pos_grid.unsqueeze(0).expand(T, G, G, C)[is_new_token]
 
-        full_tile_written = torch.zeros(T, G, G, C, device=dev, dtype=fresh_vals.dtype)
-        full_tile_written[needs_fresh_embed] = fresh_vals
-        gather_idx = tile_source_frame.unsqueeze(-1).expand(T, G, G, C)
-        full_tile_embed = torch.gather(full_tile_written, 0, gather_idx)      # (T,G,G,C)
+        tile_embed = torch.zeros(T, G, G, C, device=dev, dtype=fresh_vals.dtype)
+        tile_embed[is_new_token] = fresh_vals
 
         # ---- merge pass, grouped by scale (scale-major order first; frame
         # index recorded per event so the packed sequence can be reordered to
         # frame-major -- required for per-frame BlockDiagonalMask boundaries).
         scale_tokens, scale_frame_idx, scale_events = [], [], []
+        zero3_pad = None
         for idx, ps in enumerate(apt.patch_sizes):
             code = idx + 1
             s = ps // base_p
@@ -223,20 +310,63 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
             event_mask = (coarse_code == code) & coarse_new                # (T, G//s, G//s)
             n_events = int(event_mask.sum().item())
             scale_events.append((event_mask, s))
-            if n_events == 0:
-                continue
 
             if s == 1:
-                token_value = full_tile_embed[event_mask]                  # (n_events, C)
+                # Base scale calls no ZeRO-3-partitioned module here (its tiles were
+                # embedded unconditionally above), so an empty scale is safe to skip.
+                if n_events == 0:
+                    continue
+                token_value = tile_embed[event_mask]                       # (n_events, C)
             else:
-                children = full_tile_embed.view(T, G // s, s, G // s, s, C)
-                children = children.permute(0, 1, 3, 2, 4, 5)              # (T,Gs,Gs,s,s,C)
-                children = children[event_mask]                            # (n_events,s,s,C)
-                attn_in = children.permute(0, 3, 1, 2).contiguous()        # (n_events,C,s,s)
-                for _ in range(idx):
+                # patch_attn / zero_conv / _embed_patches are ZeRO-3-PARTITIONED: every
+                # call issues an all-gather. A rank whose clip happens to have no cells
+                # at this scale must STILL issue them, in the same order, or the
+                # collective sequence desyncs across ranks and the job deadlocks (NCCL
+                # watchdog after ~30 min, naming neither rank nor cause). So the calls
+                # below are unconditional, on dummy tensors when n_events == 0 -- the
+                # same fix already applied inside siglip_apt_embeddings._embed.
+                if n_events > 0:
+                    children = tile_embed.view(T, G // s, s, G // s, s, C)
+                    children = children.permute(0, 1, 3, 2, 4, 5)           # (T,Gs,Gs,s,s,C)
+                    children = children[event_mask]                         # (n_events,s,s,C)
+                    attn_in = children.permute(0, 3, 1, 2).contiguous()     # (n_events,C,s,s)
+                else:
+                    attn_in = torch.zeros(1, C, s, s, device=dev, dtype=tile_embed.dtype)
+
+                for _ in range(idx):                                        # Conv2d^i
                     attn_in = apt.patch_attn(attn_in)
-                attn_out = attn_in.squeeze(-1).squeeze(-1)                 # (n_events, C)
-                merged = apt.zero_conv(attn_out)
+                merged = apt.zero_conv(attn_in.squeeze(-1).squeeze(-1))     # (n_events|1, C)
+
+                # E(Resize_p(P_i)) -- the coarse region resized to one base patch and
+                # embedded by the frozen conv. Applied to EVERY event, which is what
+                # keeps APT's zero-init identity: zero_conv is zero-init, so a coarse
+                # token starts at exactly E(Resize_p) + pos, i.e. plain APT, i.e. no
+                # perturbation of the pretrained model at step 0. (The removed OVERRIDE
+                # class skipped this term and relied on the zero-init merge alone, which
+                # made its tokens a bare position embedding at step 0 -- see the history
+                # note in apt_temporal_static_tokens.py.)
+                group_masks = {
+                    p: (event_mask.to(frames.dtype) if p == ps
+                        else torch.zeros(T, apt.image_size // p, apt.image_size // p,
+                                          device=dev, dtype=frames.dtype))
+                    for p in apt.patch_sizes
+                }
+                patch_groups = apt.tokenizer.construct_patch_groups(frames, group_masks)
+                resize_patches = patch_groups[f"resized_patches_{ps}"]
+                if n_events == 0:
+                    resize_patches = torch.zeros(1, 3, base_p, base_p, device=dev,
+                                                 dtype=frames.dtype)
+                embed_scale = apt._embed_patches(resize_patches).to(merged.dtype)
+
+                if n_events == 0:
+                    # Padding calls only. Fold them into the graph with weight 0 so
+                    # patch_attn/zero_conv stay reachable from the loss on this rank --
+                    # a forward with no corresponding backward leaves their grad hooks
+                    # unfired, desyncing the gradient reduce-scatter and reintroducing
+                    # the very deadlock the unconditional calls exist to prevent.
+                    pad = merged.sum() + embed_scale.sum()
+                    zero3_pad = pad if zero3_pad is None else zero3_pad + pad
+                    continue
 
                 new_g = apt.image_size // ps
                 resampled_pos = resample_abs_pos_embed(
@@ -246,39 +376,7 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
                 pos_grid_ps = resampled_pos.view(new_g, new_g, C)
                 pos_for_events = pos_grid_ps.unsqueeze(0).expand(T, new_g, new_g, C)[event_mask]
 
-                # FRESH vs OVERRIDE events at this scale get different
-                # treatment (see apt_temporal_static_tokens.classify_cells):
-                #   FRESH    -- a genuinely new merge with no trustworthy prior
-                #               cache for its children -> anchor it with a
-                #               direct E(Resize_p) re-embed of the region, same
-                #               as ordinary per-frame APT does.
-                #   OVERRIDE -- majority of the children are unchanged and
-                #               already have valid cached embeddings (`merged`
-                #               above already mixes those cached values with a
-                #               fresh embed of the dirty minority); re-scanning
-                #               every pixel in the region again via E(Resize_p)
-                #               would just redo work the cache already has, so
-                #               skip it -- `merged` alone carries the token.
-                # NOTE: apt._embed_patches is a ZeRO-3-partitioned module, so its
-                # forward must be called unconditionally on every rank, every step --
-                # gating this on is_fresh_event.any() let ranks skip the call on
-                # steps where their local clip happened to have no FRESH cells at
-                # this scale, desyncing the all-gather collective sequence across
-                # ranks and deadlocking (NCCL watchdog timeout after 30 min).
-                is_fresh_event = (cls[:, ::s, ::s] == FRESH)[event_mask]      # (n_events,)
-                fresh_event_mask = event_mask & (cls[:, ::s, ::s] == FRESH)
-                event_masks_for_groups = {
-                    p: (fresh_event_mask.to(frames.dtype) if p == ps
-                        else torch.zeros(T, apt.image_size // p, apt.image_size // p,
-                                          device=dev, dtype=frames.dtype))
-                    for p in apt.patch_sizes
-                }
-                patch_groups = apt.tokenizer.construct_patch_groups(frames, event_masks_for_groups)
-                resize_patches = patch_groups[f"resized_patches_{ps}"]
-                embed_scale = torch.zeros_like(merged)
-                embed_scale[is_fresh_event] = apt._embed_patches(resize_patches).to(embed_scale.dtype)
-
-                token_value = merged + embed_scale.to(merged.dtype) + pos_for_events.to(merged.dtype)
+                token_value = merged + embed_scale + pos_for_events.to(merged.dtype)
 
             run_length_repr = run_length[:, ::s, ::s][event_mask]          # (n_events,)
             length_idx = (run_length_repr - 1).clamp(min=0, max=self.reuse_len_embed.num_embeddings - 1)
@@ -289,6 +387,8 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
             scale_frame_idx.append(frame_idx_for_events)
 
         combined_scale_major = torch.cat(scale_tokens, dim=0)              # (N, C)
+        if zero3_pad is not None:
+            combined_scale_major = combined_scale_major + 0.0 * zero3_pad
         frame_idx_scale_major = torch.cat(scale_frame_idx, dim=0)          # (N,)
 
         # Reorder to frame-major so per-frame blocks are contiguous for the
@@ -300,8 +400,10 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
         combined_frame_major = combined_scale_major[order]
 
         sorted_frame_idx = frame_idx_scale_major[order]
-        seqlens = [int((sorted_frame_idx == t).sum().item()) for t in range(T)]
-        seqlens = [n for n in seqlens if n > 0]                            # skip fully-redundant frames
+        # Unfiltered, length T. "reuse" needs this to keep q_seqlen and kv_seqlen describing
+        # the SAME frames; the legacy path filters the zeros out just below.
+        events_per_frame = [int((sorted_frame_idx == t).sum().item()) for t in range(T)]
+        seqlens = [n for n in events_per_frame if n > 0]                   # skip fully-redundant frames
 
         # Rebuild packed_row_id (scale-major) -> remap to frame-major via inverse_order.
         packed_row_id = torch.full((T, G, G), -1, dtype=torch.long, device=dev)
@@ -322,9 +424,20 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
         origin_index = torch.gather(packed_row_id, 0, token_origin_frame)  # (T,G,G)
         assert (origin_index >= 0).all(), "every base cell must resolve to a valid packed row"
 
-        attn_bias = BlockDiagonalMask.from_seqlens(seqlens)
-        x = combined_frame_major.unsqueeze(0)                              # (1,N,C)
-        combined_survivors = apt._run_encoder(x, attn_bias).squeeze(0)     # (N,C)
+        if self.attn_mode == "reuse":
+            # Events attend over their frame's FULL partition (fresh + carried tokens),
+            # not just the handful of other events in that frame. Reduces to plain APT
+            # when nothing is reused -- see _run_encoder_reuse / _kv_rows_per_frame.
+            combined_survivors = self._run_encoder_reuse(
+                combined_frame_major, events_per_frame, origin_index
+            )                                                              # (N,C)
+        else:
+            # LEGACY "per_frame": each frame's events attend ONLY to each other. A frame
+            # that changed little encodes its few new tokens against almost nothing, while
+            # the SigLIP weights expect a whole frame's worth of context. Kept for ablation.
+            attn_bias = BlockDiagonalMask.from_seqlens(seqlens)
+            x = combined_frame_major.unsqueeze(0)                          # (1,N,C)
+            combined_survivors = apt._run_encoder(x, attn_bias).squeeze(0) # (N,C)
 
         P = G * G
         return combined_survivors, origin_index, T, P
@@ -352,7 +465,7 @@ if __name__ == "__main__":
     ).to(dev, dtype).eval()
 
     tapt = SiglipAPTTemporalEmbeddings(
-        apt, threshold=0.1, majority_ratio=0.5, max_frames=16,   # 0.1: RLT's own default scale
+        apt, threshold=0.1, max_frames=16,   # 0.1: RLT's own default scale
     ).to(dev, dtype).eval()
 
     G = img // base_p
@@ -382,6 +495,7 @@ if __name__ == "__main__":
         f"got {N} vs {expected_n}"
     )
     assert torch.isfinite(survivors.float()).all(), "non-finite survivors"
+    print(f"[static clip] stats: {tapt.last_stats}")
 
     dense = apt_temporal_scatter_back(survivors, origin_index, T_out, P)
     assert dense.shape == (T, P, cfg.hidden_size)
@@ -400,11 +514,11 @@ if __name__ == "__main__":
     print(f"OK: fully static clip -> {N} fresh events (frame 0's own scale), "
           f"broadcast identically + value-matched to every frame.")
 
-    # --- Test 2: max_window=1-equivalent sanity -- a 2-frame clip where frame
-    #     1 is completely different (independent, high-entropy) content must
-    #     produce 2 fresh events (no illegitimate collapsing across unrelated
-    #     content), and running plain per-frame APT on each frame separately
-    #     must give the same per-frame dense values TAPT produces.
+    # --- Test 2: a 2-frame clip where frame 1 is completely different
+    #     (independent, high-entropy) content must produce 2 frames' worth of
+    #     fresh events (no illegitimate collapsing across unrelated content),
+    #     and running plain per-frame APT on each frame separately must give the
+    #     same per-frame dense values TAPT produces.
     torch.manual_seed(1)
     f0 = torch.rand(1, 3, img, img, device=dev, dtype=dtype)
     f1 = torch.rand(1, 3, img, img, device=dev, dtype=dtype)
@@ -416,7 +530,6 @@ if __name__ == "__main__":
     assert torch.isfinite(dense2.float()).all()
 
     # Independently run plain per-frame APT on each frame.
-    from siglip_apt_embeddings import apt_scatter_back
     ref0_surv, ref0_mask, ref0_masks, ref0_T, ref0_P = apt(clip2_norm[0:1])
     ref0_dense = apt_scatter_back(ref0_surv, ref0_mask, ref0_masks, base_p, img)
     ref1_surv, ref1_mask, ref1_masks, ref1_T, ref1_P = apt(clip2_norm[1:2])
@@ -458,6 +571,19 @@ if __name__ == "__main__":
     )
     print("OK: mixed fresh->redundant->fresh clip: middle frame contributes zero rows, "
           "endpoints value-match plain per-frame APT.")
+
+    # --- Test 4 (the zero-init identity): with zero_conv zero-init, EVERY coarse
+    #     token -- not just some of them -- must equal E(Resize_p) + pos + psi(0),
+    #     i.e. exactly what plain APT produces. This is the property the removed
+    #     OVERRIDE class broke: its tokens skipped the E(Resize_p) anchor and so
+    #     collapsed to a bare position embedding at step 0. Tests 1-3 above already
+    #     assert TAPT == plain APT value-for-value on every frame they cover, which
+    #     is that property; this makes the reason explicit.
+    assert float(apt.zero_conv.weight.abs().sum()) == 0.0, "zero_conv must be zero-init"
+    assert float(apt.zero_conv.bias.abs().sum()) == 0.0, "zero_conv must be zero-init"
+    assert float(tapt.reuse_len_embed.weight.abs().sum()) == 0.0, "psi must be zero-init"
+    print("OK: zero-init at the seam -> every TAPT token reduces to plain APT's "
+          "E(Resize_p)+pos at step 0 (asserted value-for-value by tests 1-3).")
 
     print("\nOK: SigLIP-APT-Temporal embeddings run end-to-end "
           "(classification -> embed/merge -> xformers attn -> scatter-back).")

@@ -14,38 +14,76 @@ whole clip (compute_patch_entropy_batched / select_patches_by_threshold
 already operate per-frame with zero cross-frame mixing, so masks[ps] already
 comes out as (T, G_s, G_s) -- no new code needed for that step). Temporal
 redundancy is resolved SECOND, per base cell, comparing frame t against frame
-t-1:
+t-1.
 
-  * shape match (frame t's cell exists at the same scale/boundary in frame
-    t-1's own partition too) + zero dirty subtiles  -> REDUNDANT: collapse,
-    no fresh embed, extend the running temporal lineage.
-  * shape match + any dirty subtile                 -> FRESH: re-embed at
-    frame t's own scale, exactly like ordinary per-frame APT.
-  * shape mismatch (frame t's own entropy decision disagrees with frame
-    t-1's) + majority of subtiles dirty              -> FRESH, same as above.
-    This is the case pure spatial entropy can't catch on its own: a region
+The reuse rule is a single conjunction:
+
+    REUSE a cell iff  (a) frame t's own cell exists at the SAME scale and
+                          boundary in frame t-1's partition  [shape_match],
+                and   (b) NOTHING inside it changed vs. frame t-1  [all_quiet].
+
+    Otherwise the cell is FRESH: re-embed at frame t's own scale, exactly like
+    ordinary per-frame APT.
+
+Both conditions are load-bearing and neither implies the other:
+
+  * (a) alone is not enough -- a cell can keep its shape while its content
+    changes completely.
+  * (b) alone is not enough -- there is literally nothing to carry forward
+    when the shapes disagree. Frame t wants (say) one 2p token; frame t-1
+    only ever produced four p tokens covering that region. No token of the
+    right shape exists at t-1, so "reuse" is not an option even when the
+    pixels are identical.
+
+  * (b) also catches what pure spatial entropy CANNOT see on its own: a region
     can look spatially uniform *within* one frame (low local variance ->
     "mergeable") while having changed completely since the previous frame (a
-    flat region's value shifting) -- the temporal signal overrides the
-    spatial merge decision here.
-  * shape mismatch + minority of subtiles dirty       -> OVERRIDE: still
-    merge at frame t's OWN scale (not t-1's -- see cell_dirty_stats'
-    docstring for why aggregating over t-1's footprint instead produced
-    inconsistent classification within a single one of frame t's cells),
-    fresh-embed only the dirty minority sub-tiles, reuse cached embeddings
-    for the quiet majority, tag as continuing the run.
+    flat region's value shifting). The temporal signal overrides the spatial
+    merge decision there.
 
-The majority-vote aggregation (cell_dirty_stats) is always keyed to frame t's
-OWN cell footprint (masks[ps][t]), same as shape_match -- this guarantees
-every base cell belonging to one of frame t's own cells gets the identical
-classification, which the embedding/merge pass in
-siglip_apt_temporal_embeddings.py depends on.
+HISTORY -- why there is no third case. An earlier version had an OVERRIDE
+class for (shape mismatch + only a MINORITY of sub-tiles dirty): merge at
+frame t's own scale, but fresh-embed only the dirty minority and pull the
+quiet majority from a cached per-base-tile embedding table. It was removed,
+because it bought nothing:
 
-The per-base-tile "did this change vs. the previous frame" signal is RLT's
-own existing primitive, reused UNCHANGED (rlt_static_tokens.batched_find_idxs_to_keep,
+  * OVERRIDE cells still EMIT A TOKEN (they were `cls != REDUNDANT`), so they
+    still paid all of SigLIP's transformer blocks as a query. Collapsing
+    OVERRIDE into FRESH leaves the token count, the keep rate, the attention
+    cost, the run-lengths and the scatter-back all bit-for-bit identical.
+  * The only thing it saved was the FROZEN patch conv on a few 14x14 tiles
+    (~0.7M MACs) against ~410M MACs of transformer per token -- under 1%.
+  * It cost real accuracy and real correctness. FRESH embeds the region from
+    frame t's ACTUAL pixels; OVERRIDE stitched in cached embeddings that are
+    merely within-threshold of them. And because OVERRIDE deliberately skipped
+    the E(Resize_p) pixel anchor, relying on the zero-initialised merge alone,
+    an OVERRIDE token at step 0 was EXACTLY a bare position embedding -- no
+    visual content at all, silently blanking that region of the frame and
+    destroying APT's zero-init identity property.
+  * It also required a whole second carry-forward index (the per-base-tile
+    embedding cache) and a majority_ratio hyperparameter, both of which are
+    now gone.
+
+Note what OVERRIDE never did: it never recovered a lost reuse opportunity. A
+cell with (shape mismatch + nothing dirty) -- a region that did not change AT
+ALL, whose quadtree boundaries merely wobbled across an entropy threshold --
+was an OVERRIDE, i.e. still a full-price token. That case is the real ceiling
+on TAPT's savings, and it is a PARTITION-STABILITY problem, not a
+classification problem; see classification_stats(), which measures it directly.
+
+The per-base-tile "did this change vs. the previous frame" signal is RLT's own
+existing primitive (rlt_static_tokens.batched_find_idxs_to_keep{,_ref},
 tubelet_size=1): RLT's base-grid change detector becomes APT-temporal's dirty
-signal. Its "always keep the first frame" convention also gives "frame 0 is
-always fresh" for free (see classify_cells).
+signal, sharing the SAME mask_mode/refresh_every knobs and the SAME default
+("ref") RLT itself defaults to -- see batched_find_idxs_to_keep_ref's
+docstring: the naive consecutive-frame diff ("consec") tests drift against
+frame t-1 while a REDUNDANT cell is actually carried forward from whichever
+frame it last changed in, possibly many frames back, so slow per-frame drift
+under `threshold` accumulates unboundedly along a long carry chain -- exactly
+the failure mode TAPT's own REDUNDANT run-lengths (compute_run_lengths) can
+produce. "ref" bounds this by construction, diffing each tile against the
+reference it would actually reuse. Its "always keep the first frame"
+convention also gives "frame 0 is always fresh" for free (see classify_cells).
 
 Everything here is fully vectorized across the whole clip -- shape/dirty
 comparisons only ever reference frame t vs. frame t-1's own independently
@@ -57,18 +95,18 @@ cells per scale; that's a batched-per-scale operation, not a sequential one,
 mirroring how SiglipAPTEmbeddings._embed already loops over scales.)
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import torch
 import torch.nn.functional as F
 
 try:
-    from .rlt_static_tokens import batched_find_idxs_to_keep
+    from .rlt_static_tokens import batched_find_idxs_to_keep, batched_find_idxs_to_keep_ref
 except ImportError:  # allow running this file directly as a script for testing
-    from rlt_static_tokens import batched_find_idxs_to_keep
+    from rlt_static_tokens import batched_find_idxs_to_keep, batched_find_idxs_to_keep_ref
 
 # Per-base-cell classification codes (see module docstring).
-REDUNDANT, FRESH, OVERRIDE = 0, 1, 2
+REDUNDANT, FRESH = 0, 1
 
 
 def dense_scale_code_grid(masks: Dict[int, torch.Tensor], patch_sizes: List[int],
@@ -94,9 +132,10 @@ def dense_scale_code_grid(masks: Dict[int, torch.Tensor], patch_sizes: List[int]
 
 
 def dirty_subtile_mask(frames: torch.Tensor, threshold: float,
-                        base_patch_size: int) -> torch.Tensor:
+                        base_patch_size: int, mask_mode: str = "ref",
+                        refresh_every: int = 0) -> torch.Tensor:
     """Per-base-tile "changed vs. previous frame" mask -- RLT's own primitive,
-    reused unchanged, on the SAME pixel scale RLT itself uses.
+    on the SAME pixel scale RLT itself uses.
 
     frames: (T, 3, H, W) SigLIP-normalized pixels (the same tensor scale
         SiglipRLTEmbeddings.forward feeds straight into this same primitive,
@@ -105,15 +144,30 @@ def dirty_subtile_mask(frames: torch.Tensor, threshold: float,
         knob between RLT and APT-Temporal instead of two differently-scaled
         thresholds for the same underlying question ("did this patch change
         vs. the previous frame?").
+    mask_mode: "ref" (default, matches SiglipRLTEmbeddings' own default) diffs
+        each tile against the reference it would actually be carried forward
+        from, bounding drift by `threshold` regardless of run length; "consec"
+        is the legacy paper behaviour (diff against frame t-1 only), which lets
+        slow per-frame drift accumulate unboundedly across a long REDUNDANT
+        run -- see batched_find_idxs_to_keep_ref's docstring and the module
+        docstring above. `refresh_every` (ref mode only) force-refreshes every
+        Nth frame regardless of drift; 0 disables.
     Returns (T, G, G) bool. Frame 0 is all True (RLT's own "always keep the
-    first frame via a dummy 255-valued reference" convention, see
-    rlt_static_tokens.batched_find_idxs_to_keep) -- this matches "frame 0
+    first frame via a dummy reference" convention, see
+    rlt_static_tokens.batched_find_idxs_to_keep{,_ref}) -- this matches "frame 0
     always needs a fresh embed" for free.
     """
+    assert mask_mode in ("ref", "consec"), f"unknown mask_mode {mask_mode!r}"
     x5d = frames.permute(1, 0, 2, 3).unsqueeze(0)             # (1,3,T,H,W)
-    keep = batched_find_idxs_to_keep(
-        x5d, threshold=threshold, tubelet_size=1, patch_size=base_patch_size
-    )                                                          # (1, T*G*G) bool, (t,h,w) order
+    if mask_mode == "ref":
+        keep = batched_find_idxs_to_keep_ref(
+            x5d, threshold=threshold, patch_size=base_patch_size,
+            refresh_every=refresh_every,
+        )                                                      # (1, T*G*G) bool, (t,h,w) order
+    else:
+        keep = batched_find_idxs_to_keep(
+            x5d, threshold=threshold, tubelet_size=1, patch_size=base_patch_size
+        )                                                      # (1, T*G*G) bool, (t,h,w) order
     T = frames.shape[0]
     G = x5d.shape[-1] // base_patch_size
     return keep.view(T, G, G)
@@ -150,40 +204,34 @@ def shape_match_grid(scale_grid: torch.Tensor, masks: Dict[int, torch.Tensor],
     return out
 
 
-def cell_dirty_stats(dirty: torch.Tensor, masks: Dict[int, torch.Tensor],
-                      patch_sizes: List[int], base_patch_size: int,
-                      majority_ratio: float = 0.5) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-base-cell 'all quiet' / 'majority dirty', aggregated over FRAME T's
-    OWN cell footprint (masks[ps][t]) -- deliberately NOT the previous frame's
-    footprint.
+def cell_all_quiet(dirty: torch.Tensor, masks: Dict[int, torch.Tensor],
+                    patch_sizes: List[int], base_patch_size: int) -> torch.Tensor:
+    """Per-base-cell "nothing inside this cell changed", aggregated over FRAME
+    T'S OWN cell footprint (masks[ps][t]) -- deliberately NOT the previous
+    frame's footprint.
 
-    An earlier version of this function aggregated over scale_grid[t-1]'s
-    footprint instead, reasoning that "the candidate being tested for
-    redundancy is whatever t-1 treated as one cell." That's wrong: when frame
-    t's own entropy decides to MERGE a region that frame t-1 had split into
-    multiple, differently-scaled sub-cells, aggregating per t-1's (heterogeneous)
-    structure produces a DIFFERENT classification for different sub-tiles
-    within what is otherwise ONE of frame t's own cells -- which breaks the
-    invariant the embedding/merge pass depends on (every base cell in one of
-    frame t's own cells must resolve to the same decision, since they all
-    become ONE token together). Confirmed on real video: this produced base
-    cells with no valid packed row at all.
+    An earlier version aggregated over scale_grid[t-1]'s footprint instead,
+    reasoning that "the candidate being tested for redundancy is whatever t-1
+    treated as one cell." That's wrong: when frame t's own entropy decides to
+    MERGE a region that frame t-1 had split into multiple, differently-scaled
+    sub-cells, aggregating per t-1's (heterogeneous) structure produces a
+    DIFFERENT classification for different sub-tiles within what is otherwise
+    ONE of frame t's own cells -- which breaks the invariant the
+    embedding/merge pass depends on (every base cell in one of frame t's own
+    cells must resolve to the same decision, since they all become ONE token
+    together). Confirmed on real video: this produced base cells with no valid
+    packed row at all.
 
     Aggregating over frame t's own footprint instead guarantees uniformity by
-    construction, since shape_match/all_quiet/majority_dirty are then ALL
-    keyed to the exact same masks[ps][t] restriction. The one "degenerate"
-    case -- frame t's own cell is already at base scale (a mismatch that
-    resolved straight to individual tiles) -- just makes the FRESH/OVERRIDE
-    distinction a no-op for that tile (both fresh-embed it if dirty, both can
-    reuse cache if quiet); it does not reintroduce any inconsistency.
+    construction, since shape_match and all_quiet are then BOTH keyed to the
+    exact same masks[ps][t] restriction.
 
-    Returns (all_quiet, majority_dirty): each (T, G, G) bool, broadcast
-    uniformly over frame t's own cell footprint at whichever scale it is.
+    Returns (T, G, G) bool, broadcast uniformly over frame t's own cell
+    footprint at whichever scale it is.
     """
     T, G, _ = dirty.shape
     dirty_f = dirty.float()
     all_quiet = torch.zeros(T, G, G, dtype=torch.bool, device=dirty.device)
-    majority_dirty = torch.zeros_like(all_quiet)
     for ps in patch_sizes:
         s = ps // base_patch_size
         cur_mask = masks[ps].bool()                            # coarse grid (G/s, G/s)
@@ -195,38 +243,68 @@ def cell_dirty_stats(dirty: torch.Tensor, masks: Dict[int, torch.Tensor],
             frac = frac.repeat_interleave(s, dim=1).repeat_interleave(s, dim=2)   # -> base grid
             mask_base = cur_mask.repeat_interleave(s, dim=1).repeat_interleave(s, dim=2)  # -> base grid
         all_quiet = all_quiet | ((frac == 0) & mask_base)
-        majority_dirty = majority_dirty | ((frac > majority_ratio) & mask_base)
-    return all_quiet, majority_dirty
+    return all_quiet
 
 
-def classify_cells(shape_match: torch.Tensor, all_quiet: torch.Tensor,
-                    majority_dirty: torch.Tensor) -> torch.Tensor:
-    """(T,G,G) long in {REDUNDANT, FRESH, OVERRIDE}. Frame 0 (no t-1 to compare
-    against) is forced to FRESH explicitly -- shape_match[0] is meaningless
-    there (shape_match_grid leaves row 0 at its zero-initialized default,
-    since there's no t-1), so this is an explicit special case rather than
-    relying on degenerate algebra to happen to fall through to FRESH.
+def classify_cells(shape_match: torch.Tensor, all_quiet: torch.Tensor) -> torch.Tensor:
+    """(T,G,G) long in {REDUNDANT, FRESH}.
+
+    REDUNDANT (reuse the carried token, emit nothing) iff the cell kept its
+    shape AND nothing inside it changed; FRESH (re-embed at frame t's own
+    scale) otherwise. See the module docstring for why both conditions are
+    required and why there is no third class.
+
+    Frame 0 (no t-1 to compare against) is forced to FRESH explicitly --
+    shape_match[0] is meaningless there (shape_match_grid leaves row 0 at its
+    zero-initialized default, since there's no t-1), so this is an explicit
+    special case rather than relying on degenerate algebra to happen to fall
+    through to FRESH.
     """
-    redundant = shape_match & all_quiet
-    fresh = (shape_match & ~all_quiet) | (~shape_match & majority_dirty)
-    override = (~shape_match) & (~majority_dirty)
-    out = torch.full_like(shape_match, REDUNDANT, dtype=torch.long)
-    out = torch.where(fresh, torch.full_like(out, FRESH), out)
-    out = torch.where(override, torch.full_like(out, OVERRIDE), out)
+    out = torch.where(
+        shape_match & all_quiet,
+        torch.full_like(shape_match, REDUNDANT, dtype=torch.long),
+        torch.full_like(shape_match, FRESH, dtype=torch.long),
+    )
     out[0] = FRESH
     return out
+
+
+def classification_stats(shape_match: torch.Tensor, all_quiet: torch.Tensor) -> Dict[str, float]:
+    """Diagnostics over frames 1..T-1 (frame 0 is unconditionally FRESH and
+    would only dilute the rates).
+
+    The number that matters is `missed_reuse`: base cells where NOTHING changed
+    (all_quiet) but the quadtree boundaries disagree with the previous frame
+    (not shape_match), so the cell cannot be carried forward and pays for a
+    full token anyway. These are pure loss -- a region of video that did not
+    change, re-encoded from scratch because an entropy value wobbled across a
+    threshold between frames.
+
+    A high missed_reuse says the ceiling on TAPT's savings is set by PARTITION
+    INSTABILITY, not by how much the video actually moves, and points at
+    threshold hysteresis / windowed re-partitioning rather than at anything in
+    the classifier.
+    """
+    if shape_match.shape[0] < 2:
+        return {}
+    sm, aq = shape_match[1:], all_quiet[1:]
+    n = float(sm.numel())
+    return {
+        "shape_match": float(sm.sum()) / n,        # partition agreed with t-1
+        "all_quiet": float(aq.sum()) / n,          # nothing in the cell changed
+        "redundant": float((sm & aq).sum()) / n,   # both -> token reused (the actual saving)
+        "missed_reuse": float((~sm & aq).sum()) / n,  # quiet but unreusable -> partition instability
+    }
 
 
 def compute_origin_index(event_mask: torch.Tensor) -> torch.Tensor:
     """(T,G,G) bool "is this a new/refresh event here" -> (T,G,G) long: the
     most recent frame index t' <= t (per base cell) where event_mask was True.
 
-    Mirrors the RLT carry-forward cummax/gather pattern (siglip_rlt_embeddings._carry_idx). Used both
-    for (a) which packed merged-token row supplies (t,i,j)'s dense output
-    value [event_mask = is_new_token], and (b) which frame's per-tile
-    frozen-encoder embedding a base tile's cached value comes from
-    [event_mask = needs_fresh_embed]. Requires event_mask[0] to be all True
-    (guaranteed: frame 0 is always FRESH, and FRESH always needs_fresh_embed).
+    Mirrors the RLT carry-forward cummax/gather pattern (siglip_rlt_embeddings._carry_idx).
+    Used to resolve which packed merged-token row supplies (t,i,j)'s dense output
+    value [event_mask = is_new_token]. Requires event_mask[0] to be all True
+    (guaranteed: frame 0 is always FRESH).
     """
     T = event_mask.shape[0]
     dev = event_mask.device
@@ -262,14 +340,13 @@ if __name__ == "__main__":
     # entropy thresholds, which are finicky to tune blindly) so each quadrant
     # exercises a specific path:
     #   TR quadrant: f2 MERGES to 28px (f1 had it split to base -> mismatch),
-    #                3/4 constituent tiles dirty -> majority -> FRESH
+    #                3/4 constituent tiles dirty          -> FRESH (content changed)
     #   BL quadrant: f2 MERGES to 28px (f1 had it split to base -> mismatch),
-    #                1/4 constituent tiles dirty -> minority -> OVERRIDE
+    #                ZERO tiles dirty                     -> FRESH, and this is the
+    #                MISSED REUSE case: nothing changed, but there is no token of
+    #                the right shape at f1 to carry forward. Pure partition-jitter
+    #                loss -- exactly what classification_stats().missed_reuse counts.
     #   TL, BR quadrants: stay merged throughout, no dirty sub-tiles -> REDUNDANT
-    # Frame t's own cell must be the NON-base scale here (28px, not 14px) for
-    # the majority vote to be meaningful -- see cell_dirty_stats' docstring:
-    # aggregating over frame t's OWN footprint at BASE scale would trivially
-    # vote per-tile (fine, just not what this test is exercising).
     # This is a valid test of these primitives regardless of how masks/dirty
     # were obtained -- they don't care whether entropy or a human produced them.
     torch.manual_seed(0)
@@ -296,25 +373,31 @@ if __name__ == "__main__":
 
     dirty = torch.zeros(T, G, G, dtype=torch.bool)
     dirty[0] = True                       # RLT convention: frame 0 always "dirty" (always kept)
-    # f2 TR quadrant (rows 0-1, cols 2-3): 3/4 sub-tiles dirty -> majority.
+    # f2 TR quadrant (rows 0-1, cols 2-3): 3/4 sub-tiles dirty -> content changed.
     dirty[2, 0, 2] = dirty[2, 0, 3] = dirty[2, 1, 2] = True
-    # f2 BL quadrant (rows 2-3, cols 0-1): 1/4 sub-tiles dirty -> minority.
-    dirty[2, 2, 0] = True
+    # f2 BL quadrant (rows 2-3, cols 0-1): NOTHING dirty -> the missed-reuse case.
     print("dirty:\n", dirty)
 
     shape_match = shape_match_grid(scale_grid, masks, patch_sizes, base_p)
-    all_quiet, majority_dirty = cell_dirty_stats(
-        dirty, masks, patch_sizes, base_p, majority_ratio=0.5
-    )
-    cls = classify_cells(shape_match, all_quiet, majority_dirty)
-    print("classification (0=REDUNDANT,1=FRESH,2=OVERRIDE):\n", cls)
+    all_quiet = cell_all_quiet(dirty, masks, patch_sizes, base_p)
+    cls = classify_cells(shape_match, all_quiet)
+    print("classification (0=REDUNDANT,1=FRESH):\n", cls)
 
     assert (cls[0] == FRESH).all(), "frame 0 must always be FRESH"
     assert (cls[1] == REDUNDANT).all(), "f1 (identical to f0) must be fully redundant"
-    assert (cls[2, 0:2, 2:4] == FRESH).all(), "TR quadrant (majority dirty) must be FRESH"
-    assert (cls[2, 2:4, 0:2] == OVERRIDE).all(), "BL quadrant (minority dirty) must be OVERRIDE"
+    assert (cls[2, 0:2, 2:4] == FRESH).all(), "TR quadrant (content changed) must be FRESH"
+    assert (cls[2, 2:4, 0:2] == FRESH).all(), (
+        "BL quadrant: quiet but shape-mismatched -> FRESH (nothing of the right shape to carry)"
+    )
     assert (cls[2, 0:2, 0:2] == REDUNDANT).all(), "TL quadrant (untouched) must stay REDUNDANT"
     assert (cls[2, 2:4, 2:4] == REDUNDANT).all(), "BR quadrant (untouched) must stay REDUNDANT"
+
+    stats = classification_stats(shape_match, all_quiet)
+    print("stats (frames 1..T-1):", {k: round(v, 3) for k, v in stats.items()})
+    # BL quadrant of f2 = 4 of the 32 base cells over frames 1..2: quiet, but not reusable.
+    assert abs(stats["missed_reuse"] - 4 / 32) < 1e-6, (
+        f"BL quadrant of f2 must be counted as missed reuse, got {stats['missed_reuse']}"
+    )
 
     is_new_token = cls != REDUNDANT
     run_len = compute_run_lengths(is_new_token)
@@ -330,4 +413,4 @@ if __name__ == "__main__":
                 assert bool(is_new_token[o, i, j]), "origin must point at a new-token event"
                 assert o <= t, "origin must not point into the future"
     print("\nOK: apt_temporal_static_tokens primitives self-consistent "
-          "(REDUNDANT/FRESH/OVERRIDE all exercised).")
+          "(REDUNDANT/FRESH + missed-reuse accounting).")

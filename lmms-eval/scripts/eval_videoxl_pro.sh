@@ -23,15 +23,37 @@ LOG_FILE="$LOG_DIR/eval_apttemporal_$(date +%Y%m%d_%H%M%S).log"
 
 #[ use_apt , use_rlt , use_apt_temporal]
 
-args=(
+# args=(
+#   "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-apt-llava-ego4D/checkpoint-10000"
+#   "max_frames_num=128"
+#   "use_apt=True"
+#   "apt_num_scales=3"
+#   "apt_threshold=4.0:6.0"
+#   "attn_implementation=flash_attention_2"
+#   )
+
+  args=(
   "pretrained=MINT-SJTU/Video-XL-Pro-3B"
   "max_frames_num=128"
-  "attn_implementation=flash_attention_2"
   "use_rlt=True"
-  "rlt_attn_mode=reuse"
   "rlt_threshold=0.2"
-)
+  "rlt_temporal_pos_scale=0.0"
+  "rlt_attn_mode=reuse"
+  "attn_implementation=flash_attention_2"
+  )
+
+  # args=(
+  # "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-apt-llava-ego4D-short-finetune/checkpoint-6000"
+  # "max_frames_num=128"
+  # "use_apt_temporal=True"
+  # "apt_threshold=4.0:6.0"
+  # "rlt_threshold=0.2"
+  # "rlt_attn_mode=reuse"
+  # "attn_implementation=flash_attention_2"
+  # )
 MODEL_ARGS=$(IFS=,; echo "${args[*]}")
+
+# datasets = [mlvu_test , egoschema_subset]
 
 accelerate launch --num_processes=3 --main_process_port 12345 \
     -m lmms_eval \

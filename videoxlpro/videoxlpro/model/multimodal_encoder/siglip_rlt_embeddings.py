@@ -83,7 +83,7 @@ class SiglipRLTEmbeddings(nn.Module):
     def __init__(
         self,
         vision_model,
-        threshold: float = 0.1,
+        threshold: float = 0.2,
         patch_size: int = 14,
         max_frames: int = 512,
         temporal_pos_scale: float = 1.0,

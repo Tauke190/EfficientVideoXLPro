@@ -1,38 +1,83 @@
-export NUM_GPUS=1
+#!/bin/bash
+#SBATCH --job-name=videoxlpro
+#SBATCH --output=/home/av354855/EfficientVideoXLPro/slurmlogs/apt_videoxlpro-%j.out
+#SBATCH --gres-flags=enforce-binding
+#SBATCH -p gpu
+#SBATCH -C gmem80
+#SBATCH --gres=gpu:2
+#SBATCH --mem-per-cpu=10G
+#SBATCH --cpus-per-gpu=8
+
+# Starting from the pre-trained Video-XL-Pro-3B checkpoint (skips pretrain stage)
+# APT-only run: use_apt=True with mm_tunable_parts="none" -> the ONLY trainable
+# params are apt_patch_attn + apt_zero_conv (paper arXiv 2510.18091 Eq. 2), which
+# learn to fold sub-patch detail back into the merged coarse tokens. Watch
+# apt/apt_zero_conv_weight_wnorm in wandb: it starts at exactly 0 and must climb
+# off zero for the merge compensation to be learning.
+
+
+PORT=$((RANDOM % 10000 + 20000))
+while ss -tuln | grep -q ":$PORT"; do
+  PORT=$((RANDOM % 10000 + 20000))
+done
+echo "Free port found: $PORT"
+
+# Load necessary modules
+module load anaconda3
+# torch is built with cu121, so load a CUDA 12.x toolkit (default 'cuda' resolves to 13.x and
+# breaks DeepSpeedCPUAdam's JIT build). 12.2 is the closest available minor to 12.1.
+module load cuda/12.2
+
+eval "$(conda shell.bash hook)"
+
+# Activate your conda environment
+conda activate videoxlpro
+
+
+echo "Job started at $(date)"
+echo "Running on node: $(hostname)"
+echo "GPU info:"
+nvidia-smi
+
+echo "Checking PyTorch CUDA version and availability:"
+python -c "import torch; print('torch.version.cuda:', torch.version.cuda); print('torch.cuda.is_available:', torch.cuda.is_available())"
+
+# Change directory
+cd /home/av354855/EfficientVideoXLPro/videoxlpro
+
+export NUM_GPUS=2
 export NNODES=1
 export RANK=0
 export ADDR=localhost
-export PORT=12345
+
+# Bypass DeepSpeed's strict CUDA version-string check; safe because the loaded toolkit (12.x)
+# matches torch's CUDA major version (cu121). Needed for the cpu_adam JIT build under offload.
+export DS_SKIP_CUDA_CHECK=1
+
+
+# NCCL Flight Recorder: if a collective ever desyncs across ranks again (see
+# the step-3204 hang on job 351066 -- ALLGATHER_BASE timeout after the full
+# ddp_timeout with zero other diagnostic info), this dumps each rank's recent
+# collective history to disk the moment the watchdog times out, instead of
+# leaving nothing but a bare "ran for N ms" message. Both env var spellings
+# set since the flight-recorder vars were renamed across torch versions.
+export NCCL_DEBUG=INFO
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export NCCL_TRACE_BUFFER_SIZE=2000
+export NCCL_DUMP_ON_TIMEOUT=1
 
 export WANDB_PROJECT="videoxlpro-apt"
 export WANDB_ENTITY="ag8093-university-of-central-florida"
+export WANDB_DIR="/home/av354855/EfficientVideoXLPro/videoxlpro"
 
-# Starting from the pre-trained Video-XL-Pro-3B checkpoint (skips pretrain stage)
 MODEL_PATH="MINT-SJTU/Video-XL-Pro-3B"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
-# The point of this run: zero_conv (merge correction) and reuse_len_embed (staleness tag)
-# are BOTH zero-initialised, so untrained APT-Temporal has its compensation switched off
-# entirely -- the coarse token is just a raw downsampled patch embed, and a reused token
-# carries no signal that it is stale. train.py unfreezes patch_attn / zero_conv /
-# reuse_len_embed automatically whenever use_apt_temporal is set, so this run is what
-# actually turns that compensation on.
-#
-# THRESHOLD must match the eval script (lmms-eval/scripts/eval_videoxl_pro.sh). It sets how
-# much temporal reuse happens, hence how much there is to compensate FOR. Training at one
-# reuse rate and evaluating at another teaches the model to invert the wrong distortion.
-THRESHOLD=0.2
-
-# reuse = each frame's events attend over its FULL partition (fresh + carried tokens).
-# Train with `per_frame` ONLY for the ablation: it starves events of their own frame's
-# context, so zero_conv/reuse_len_embed would learn to compensate for that BUG as well as
-# for the legitimate reuse -- and the checkpoint is then invalid once the bug is fixed.
-ATTN_MODE=reuse
-
 PROMPT_VERSION=qwen_1_5
-MID_RUN_NAME="videoxlpro-3b-apt-temporal-${ATTN_MODE}-thr${THRESHOLD}"
+MID_RUN_NAME="videoxlpro-3b-apt-temporal-llava-ego4D"
 
-echo "Fine-tuning run: ${MID_RUN_NAME}  (attn_mode=${ATTN_MODE}, threshold=${THRESHOLD})"
+echo "Fine-tuning run: ${MID_RUN_NAME}"
 
 ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NNODES}" --node_rank="${RANK}" --master_addr="${ADDR}" --master_port="${PORT}" \
     videoxlpro/train/train_mem.py \
@@ -42,12 +87,12 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --data_path /home/av354855/EfficientVideoXLPro/data_mix.yaml \
     --image_folder /home/c3-0/datasets/llava_665K/playground/data \
     --video_folder /home/c3-0/datasets/Ego4D/videos/h264 \
-    --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_temporal_compressor" \
+    --mm_tunable_parts="none" \
     --use_apt_temporal True \
     --apt_thresholds "4.0,6.0" \
     --apt_num_scales 3 \
-    --rlt_threshold ${THRESHOLD} \
-    --rlt_attn_mode ${ATTN_MODE} \
+    --rlt_threshold 0.2 \
+    --rlt_attn_mode reuse \
     --rlt_mask_mode ref \
     --rlt_temporal_pos_scale 0.0 \
     --frames_upbound 32 \
@@ -67,17 +112,17 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --mm_patch_merge_type unires \
     --bf16 True \
     --run_name $MID_RUN_NAME \
-    --output_dir "/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/${MID_RUN_NAME}" \
+    --output_dir "/home/av354855/EfficientVideoXLPro/videoxlpro/outputs/checkpoints/${MID_RUN_NAME}" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 4 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 200 \
+    --save_steps 2000 \
     --save_total_limit 2 \
     --ddp_timeout 14400 \
-    --mlvu_eval_on_save False \
+    --mlvu_eval_on_save True \
     --mlvu_eval_at_start True \
     --mlvu_eval_frames 128 \
     --mlvu_eval_limit 100 \
@@ -95,3 +140,4 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --report_to wandb \
     --dataloader_drop_last True \
     --attn_implementation flash_attention_2
+  conda deactivate

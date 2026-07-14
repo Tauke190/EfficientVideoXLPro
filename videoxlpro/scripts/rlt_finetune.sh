@@ -23,16 +23,17 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --use_rlt True \
     --use_sae True \
     --rlt_threshold 0.05 \
+    --frames_upbound 57 \
+    --rlt_attn_mode resuse \
+    --rlt_mask_mode ref \
     --rlt_temporal_pos_scale 0.0 \
     --model_name_or_path ${MODEL_PATH} \
     --version ${PROMPT_VERSION} \
     --data_path /home/av354855/EfficientVideoXLPro/data_mix.yaml \
     --image_folder /home/c3-0/datasets/llava_665K/playground/data \
     --video_folder /home/c3-0/datasets/Ego4D/videos/h264 \
-    --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_temporal_compressor" \
+    --mm_tunable_parts="mm_mlp_adapter,mm_temporal_compressor" \
     --mm_vision_tower_lr=2e-6 \
-    --frames_upbound 32 \
-    --video_fps 1 \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -1 \

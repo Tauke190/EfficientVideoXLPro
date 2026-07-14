@@ -39,7 +39,7 @@ class VideoXLPro(lmms):
         max_frames_num: Optional[int] = 128,
         use_sae: Optional[bool] = True,
         use_rlt: Optional[bool] = False,
-        rlt_threshold: Optional[float] = 0.1,
+        rlt_threshold: Optional[float] = 0.2,
         rlt_temporal_pos_scale: Optional[float] = 0.0,
         rlt_attn_mode: Optional[str] = "reuse",
         rlt_mask_mode: Optional[str] = "ref",
@@ -50,7 +50,6 @@ class VideoXLPro(lmms):
         apt_num_scales: Optional[int] = 3,
         apt_input_res: Optional[int] = 392,
         use_apt_temporal: Optional[bool] = False,
-        apt_temporal_majority_ratio: Optional[float] = 0.5,
         apt_temporal_max_frames: Optional[int] = 512,
         **kwargs,
     ) -> None:
@@ -140,7 +139,6 @@ class VideoXLPro(lmms):
         # operate on the same SigLIP-normalized pixel scale, so it's one
         # shared knob rather than a second, differently-scaled threshold.
         self._model.config.use_apt_temporal = use_apt_temporal
-        self._model.config.apt_temporal_majority_ratio = apt_temporal_majority_ratio
         self._model.config.apt_temporal_max_frames = apt_temporal_max_frames
         self.model.eval()
 

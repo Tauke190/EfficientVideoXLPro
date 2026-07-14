@@ -55,10 +55,17 @@ class LlavaMetaModel:
                 # its weight and DeepSpeed Zero-3 gathers it via its forward.
                 self.get_apt_temporal_reuse_embed()
 
-            if getattr(config, "use_apt", False):
+            if getattr(config, "use_apt", False) or getattr(config, "use_apt_temporal", False):
                 # APT's trainable patch_attn/zero_conv, owned here (not inside the
                 # unregistered APT wrapper) so trained-APT checkpoints load their
                 # weights and DeepSpeed Zero-3 gathers them.
+                # Must match train.py's unfreeze/save condition (use_apt OR
+                # use_apt_temporal): APT-Temporal's coarse tokens ARE APT's merge, so it
+                # trains and saves these too. Gating construction on use_apt alone would
+                # leave a TAPT checkpoint's apt_patch_attn/apt_zero_conv with no submodule
+                # to bind to -- from_pretrained drops them as unexpected keys, _get_apt_module
+                # then rebuilds them fresh (zero_conv re-zeroed), and the trained merge is
+                # silently discarded at eval.
                 self.get_apt_patch_attn()
                 self.get_apt_zero_conv()
 
@@ -362,7 +369,7 @@ class LlavaMetaForCausalLM(ABC):
             vt = self.get_model().get_vision_tower()
             rlt = SiglipRLTEmbeddings(
                 vt.vision_tower,
-                threshold=getattr(self.config, "rlt_threshold", 0.3),
+                threshold=getattr(self.config, "rlt_threshold", 0.2),
                 patch_size=getattr(self.config, "rlt_patch_size", 14),
                 max_frames=getattr(self.config, "rlt_max_frames", 512),
                 temporal_pos_scale=getattr(self.config, "rlt_temporal_pos_scale", 1.0),
@@ -519,7 +526,12 @@ class LlavaMetaForCausalLM(ABC):
         SiglipAPTTemporalEmbeddings operates on the same SigLIP-normalized
         pixel scale RLT itself does, so it's the literal same knob rather than
         a second, differently-scaled threshold for the same underlying
-        question ("did this patch change vs. the previous frame?").
+        question ("did this patch change vs. the previous frame?"). Same
+        reasoning for config.rlt_mask_mode / config.rlt_refresh_every: the
+        drift-bounded "ref" dirty-check fix applies identically to a TAPT
+        REDUNDANT carry chain as to an RLT drop run (see dirty_subtile_mask's
+        docstring), so it shares RLT's knob and RLT's "ref" default rather
+        than a second copy of the same fix.
         """
         tapt = self.__dict__.get("_apt_temporal_module", None)
         if tapt is None:
@@ -527,10 +539,14 @@ class LlavaMetaForCausalLM(ABC):
             apt = self._get_apt_module()
             tapt = SiglipAPTTemporalEmbeddings(
                 apt,
-                threshold=getattr(self.config, "rlt_threshold", 0.1),
-                majority_ratio=getattr(self.config, "apt_temporal_majority_ratio", 0.5),
+                threshold=getattr(self.config, "rlt_threshold", 0.2),
                 max_frames=getattr(self.config, "apt_temporal_max_frames", 512),
                 reuse_len_embed=self.get_model().get_apt_temporal_reuse_embed(),
+                # Shares RLT's knob: the starvation bug and its fix are the same in both
+                # (events attend over their frame's full partition, not just each other).
+                attn_mode=getattr(self.config, "rlt_attn_mode", "reuse"),
+                mask_mode=getattr(self.config, "rlt_mask_mode", "ref"),
+                refresh_every=getattr(self.config, "rlt_refresh_every", 0),
             )
             self.__dict__["_apt_temporal_module"] = tapt
         return tapt
@@ -541,14 +557,21 @@ class LlavaMetaForCausalLM(ABC):
         Spatial redundancy is resolved first (each frame gets its own
         independent entropy-driven partition, exactly like plain APT).
         Temporal redundancy is resolved second: per base cell, frame t is
-        compared against frame t-1 and classified REDUNDANT (collapse, no
-        fresh embed) / FRESH (re-embed at frame t's own scale) / OVERRIDE
-        (shape mismatch but only a minority of sub-tiles changed -- merge
-        anyway, adopting frame t-1's boundary). See
-        apt_temporal_static_tokens.py for the full precedence rationale.
+        carried forward (REDUNDANT, emitting no token) iff its shape matches
+        frame t-1's partition AND nothing inside it changed; otherwise it is
+        FRESH and re-embedded at frame t's own scale. See
+        apt_temporal_static_tokens.py for the full rationale.
+
         Returns a tuple of (T_i, P, C) tensors -- one per clip -- so the
         standard dense pipeline (interpolate -> add_video -> SAE/DTS -> pool)
         in encode_multimodals runs unchanged. Survivors are NOT projected here.
+
+        Also logs the classification diagnostics, of which `missed_reuse` is the
+        one to watch: base cells that did not change AT ALL but still had to pay
+        for a full token because the quadtree boundaries wobbled across an entropy
+        threshold between frames. That is pure loss and it is the ceiling on TAPT's
+        savings -- a high value points at PARTITION INSTABILITY (fix with threshold
+        hysteresis or windowed re-partitioning), not at anything in the classifier.
         """
         from .multimodal_encoder.siglip_apt_temporal_embeddings import apt_temporal_scatter_back
         tapt = self._get_apt_temporal_module()
@@ -558,11 +581,14 @@ class LlavaMetaForCausalLM(ABC):
 
         dense_clips = []
         total_keep = total_dense = 0
+        clip_stats = []
         for i, frames in enumerate(per_clip_frames):
             survivors, origin_index, T, P = tapt(frames)
             n_keep, n_dense = int(survivors.shape[0]), int(T * P)
             total_keep += n_keep
             total_dense += n_dense
+            if tapt.last_stats:
+                clip_stats.append(tapt.last_stats)
             rank0_print(
                 f"[APT-Temporal+DTS] clip={i} frames={T} "
                 f"encoder survivors={n_keep}/{n_dense} ({100.0*n_keep/n_dense:.1f}% kept) "
@@ -577,6 +603,23 @@ class LlavaMetaForCausalLM(ABC):
             f"[APT-Temporal+DTS] TOTAL encoder survivors={total_keep}/{total_dense} "
             f"({100.0*total_keep/total_dense:.1f}% kept); DTS compresses the dense grid next."
         )
+        if clip_stats:
+            keys = clip_stats[0].keys()
+            avg = {k: sum(s[k] for s in clip_stats) / len(clip_stats) for k in keys}
+            # Running totals too, so a caller (eval harness / training callback) can
+            # report a stable rate over many clips rather than one clip's noise.
+            prev = getattr(self, "_apt_temporal_stat_sum", {})
+            self._apt_temporal_stat_sum = {
+                k: prev.get(k, 0.0) + sum(s[k] for s in clip_stats) for k in keys
+            }
+            self._apt_temporal_stat_n = getattr(self, "_apt_temporal_stat_n", 0) + len(clip_stats)
+            rank0_print(
+                f"[APT-Temporal] cells (frames 1..T-1): "
+                f"shape_match={100*avg['shape_match']:.1f}% all_quiet={100*avg['all_quiet']:.1f}% "
+                f"-> REDUNDANT={100*avg['redundant']:.1f}% (reused; the actual saving) | "
+                f"MISSED_REUSE={100*avg['missed_reuse']:.1f}% "
+                f"(unchanged but unreusable -- partition instability)"
+            )
         return tuple(dense_clips)
 
     @staticmethod
