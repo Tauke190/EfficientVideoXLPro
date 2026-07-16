@@ -311,20 +311,20 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
             n_events = int(event_mask.sum().item())
             scale_events.append((event_mask, s))
 
+            # patch_attn / zero_conv / _embed_patches / reuse_len_embed are ZeRO-3-
+            # PARTITIONED: every call issues an all-gather. A rank whose clip happens to
+            # have no cells at this scale must STILL issue them, in the same order, or the
+            # collective sequence desyncs across ranks and the job deadlocks (NCCL
+            # watchdog after ddp_timeout, naming neither rank nor cause). So the calls
+            # below are unconditional, on dummy tensors when n_events == 0 -- the
+            # same fix already applied inside siglip_apt_embeddings._embed.
             if s == 1:
-                # Base scale calls no ZeRO-3-partitioned module here (its tiles were
-                # embedded unconditionally above), so an empty scale is safe to skip.
-                if n_events == 0:
-                    continue
-                token_value = tile_embed[event_mask]                       # (n_events, C)
+                # Base tiles were embedded unconditionally above, so this branch calls
+                # nothing partitioned of its own; the dummy exists only to keep the shared
+                # reuse_len_embed call below well-formed when the scale is empty.
+                token_value = (tile_embed[event_mask] if n_events > 0        # (n_events, C)
+                               else tile_embed.new_zeros(1, C))
             else:
-                # patch_attn / zero_conv / _embed_patches are ZeRO-3-PARTITIONED: every
-                # call issues an all-gather. A rank whose clip happens to have no cells
-                # at this scale must STILL issue them, in the same order, or the
-                # collective sequence desyncs across ranks and the job deadlocks (NCCL
-                # watchdog after ~30 min, naming neither rank nor cause). So the calls
-                # below are unconditional, on dummy tensors when n_events == 0 -- the
-                # same fix already applied inside siglip_apt_embeddings._embed.
                 if n_events > 0:
                     children = tile_embed.view(T, G // s, s, G // s, s, C)
                     children = children.permute(0, 1, 3, 2, 4, 5)           # (T,Gs,Gs,s,s,C)
@@ -358,29 +358,41 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
                                                  dtype=frames.dtype)
                 embed_scale = apt._embed_patches(resize_patches).to(merged.dtype)
 
-                if n_events == 0:
-                    # Padding calls only. Fold them into the graph with weight 0 so
-                    # patch_attn/zero_conv stay reachable from the loss on this rank --
-                    # a forward with no corresponding backward leaves their grad hooks
-                    # unfired, desyncing the gradient reduce-scatter and reintroducing
-                    # the very deadlock the unconditional calls exist to prevent.
-                    pad = merged.sum() + embed_scale.sum()
-                    zero3_pad = pad if zero3_pad is None else zero3_pad + pad
-                    continue
+                token_value = merged + embed_scale
+                if n_events > 0:
+                    new_g = apt.image_size // ps
+                    resampled_pos = resample_abs_pos_embed(
+                        apt.base_pos_embed.to(frames.dtype), new_size=(new_g, new_g),
+                        old_size=(apt.base_grid_size, apt.base_grid_size), num_prefix_tokens=0,
+                    )
+                    pos_grid_ps = resampled_pos.view(new_g, new_g, C)
+                    pos_for_events = pos_grid_ps.unsqueeze(0).expand(T, new_g, new_g, C)[event_mask]
+                    token_value = token_value + pos_for_events.to(merged.dtype)
 
-                new_g = apt.image_size // ps
-                resampled_pos = resample_abs_pos_embed(
-                    apt.base_pos_embed.to(frames.dtype), new_size=(new_g, new_g),
-                    old_size=(apt.base_grid_size, apt.base_grid_size), num_prefix_tokens=0,
-                )
-                pos_grid_ps = resampled_pos.view(new_g, new_g, C)
-                pos_for_events = pos_grid_ps.unsqueeze(0).expand(T, new_g, new_g, C)[event_mask]
-
-                token_value = merged + embed_scale + pos_for_events.to(merged.dtype)
-
-            run_length_repr = run_length[:, ::s, ::s][event_mask]          # (n_events,)
-            length_idx = (run_length_repr - 1).clamp(min=0, max=self.reuse_len_embed.num_embeddings - 1)
+            # reuse_len_embed is model-owned and trainable, hence ZeRO-3-partitioned too
+            # (llava_arch.get_apt_temporal_reuse_embed), so this call all-gathers it like
+            # the rest. It sits outside the s==1 / s>1 split deliberately: every scale
+            # must reach it exactly once on every rank. Skipping it for an empty scale --
+            # as both branches used to, via `continue` -- makes the gather count equal the
+            # number of NON-EMPTY scales, which is decided by frame entropy and so differs
+            # between ranks holding different clips. That is what deadlocked job 351066's
+            # successor at step ~6644.
+            if n_events > 0:
+                run_length_repr = run_length[:, ::s, ::s][event_mask]      # (n_events,)
+                length_idx = (run_length_repr - 1).clamp(min=0, max=self.reuse_len_embed.num_embeddings - 1)
+            else:
+                length_idx = torch.zeros(1, device=dev, dtype=torch.long)
             token_value = token_value + self.reuse_len_embed(length_idx).to(token_value.dtype)
+
+            if n_events == 0:
+                # Padding calls only. Fold them into the graph with weight 0 so
+                # patch_attn/zero_conv/reuse_len_embed stay reachable from the loss on
+                # this rank -- a forward with no corresponding backward leaves their grad
+                # hooks unfired, desyncing the gradient reduce-scatter and reintroducing
+                # the very deadlock the unconditional calls exist to prevent.
+                pad = token_value.sum()
+                zero3_pad = pad if zero3_pad is None else zero3_pad + pad
+                continue
 
             frame_idx_for_events = torch.nonzero(event_mask, as_tuple=False)[:, 0]  # (n_events,)
             scale_tokens.append(token_value)

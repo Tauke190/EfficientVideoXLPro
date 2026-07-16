@@ -688,6 +688,19 @@ class LlavaMetaForCausalLM(ABC):
         assert sum([use_rlt, use_apt, use_apt_temporal]) <= 1, (
             "use_rlt, use_apt, and use_apt_temporal are mutually exclusive; enable one at a time"
         )
+
+        # Clip count decides how many times the encoders below -- and the sae/mm_projector
+        # loop further down -- call ZeRO-3-partitioned modules, so it must be checked
+        # BEFORE the first of those calls, not after. Checking it later cannot work: the
+        # encoders would already have desynced the collective sequence, and this check's
+        # own all-reduce would then be just another mismatched op in a jammed group
+        # (which is precisely how rank 1 came to hang inside it).
+        self._check_rank_invariant(
+            len(split_sizes) if split_sizes is not None else 1,
+            "clip count (len(split_sizes))",
+            videos_or_images.device,
+        )
+
         if use_rlt and not use_sae:
             return self.encode_multimodals_rlt(videos_or_images, video_idx_in_batch, split_sizes)
 
@@ -753,12 +766,11 @@ class LlavaMetaForCausalLM(ABC):
         #     all-gathers versus a peer rank holding an ordinary image or a 32-frame
         #     video (both of which land at bc//4 <= 24 -> exactly one call).
         #
-        # The clip count is checked (a mismatch is unrecoverable -- fail fast and name
-        # the rank rather than hang for hours); the chunk count is padded up to the
-        # global max with dummy calls, the same fix already applied to patch_attn in
-        # siglip_apt_embeddings._embed.
+        # The clip count is checked above, before the encoders run (a mismatch is
+        # unrecoverable -- fail fast and name the rank rather than hang for hours); the
+        # chunk count is padded up to the global max with dummy calls, the same fix
+        # already applied to patch_attn in siglip_apt_embeddings._embed.
         _dev = videos_or_images.device
-        self._check_rank_invariant(len(per_videos_or_images_features), "clip count (len(split_sizes))", _dev)
 
         for idx, feat in enumerate(per_videos_or_images_features):
             #print(feat.shape,end='1\n')
