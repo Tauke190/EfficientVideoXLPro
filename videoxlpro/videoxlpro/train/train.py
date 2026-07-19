@@ -2002,9 +2002,40 @@ def train(attn_implementation=None):
         )
 
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+    # Resume only from a checkpoint that can ACTUALLY be resumed. The old test was a bare
+    # checkpoint-* glob, which trusts any directory that merely looks like one -- and a
+    # killed/pruned save leaves exactly that. Two real failures came from it:
+    #   * weights written but trainer_state.json not yet -> TrainerState.load_from_json
+    #     dies with FileNotFoundError (it is written late in HF's save sequence, so any
+    #     interruption during a multi-GB ZeRO-3 save lands here).
+    #   * HF files intact but the DeepSpeed shards pruned to reclaim disk -> `latest`
+    #     still names a global_stepN dir that no longer exists, and DeepSpeed dies with
+    #     "Can't find a valid checkpoint at ...". Weights-only checkpoints like this are
+    #     still fine to EVAL, they just cannot be resumed.
+    # Both crash after model load and DeepSpeed init, so the cost is minutes of GPU time
+    # per attempt. Anything unresumable is skipped with a loud warning and training starts
+    # fresh, which is the safe default -- silently resuming half a checkpoint is worse.
+    def _is_resumable(ckpt: pathlib.Path) -> bool:
+        if not (ckpt / "trainer_state.json").is_file():
+            return False
+        latest = ckpt / "latest"          # DeepSpeed only; absent under plain DDP/FSDP
+        if latest.is_file():
+            tag = latest.read_text().strip()
+            if not tag or not (ckpt / tag).is_dir():
+                return False
+        return True
+
+    found = sorted(pathlib.Path(training_args.output_dir).glob("checkpoint-*"))
+    resumable = [c for c in found if _is_resumable(c)]
+    for c in found:
+        if c not in resumable:
+            rank0_print(f"[resume] ignoring unresumable checkpoint (missing trainer_state.json "
+                        f"or DeepSpeed shards): {c}")
+    if resumable:
+        rank0_print(f"[resume] resuming from {resumable[-1]}")
         trainer.train(resume_from_checkpoint=True)
     else:
+        rank0_print(f"[resume] no resumable checkpoint in {training_args.output_dir} -- starting fresh.")
         trainer.train()
     trainer.save_state()
 
