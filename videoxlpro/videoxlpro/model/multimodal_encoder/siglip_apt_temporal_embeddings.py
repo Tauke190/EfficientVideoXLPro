@@ -33,10 +33,14 @@ no changes to siglip_apt_embeddings.py are needed. It reuses:
                              frozen SigLIP transformer layers).
   * apt.base_pos_embed / apt.base_grid_size (position embedding resampling).
 
-New trainable parameter: a run-length embedding (reuse_len_embed), the exact
-same "model-owned, zero-init, __dict__-stashed-when-injected" pattern as
-RLT's phi_L (siglip_rlt_embeddings.py) -- tags every survivor with how many
-frames it has stood in for the model to learn to read.
+No trainable parameter of its own: like plain RLT (siglip_rlt_embeddings.py),
+TAPT adds no learnable state at the temporal seam. The only trained modules are
+APT's spatial patch_attn/zero_conv, so TAPT is exactly "APT's merge + RLT's
+reuse" and its trainable surface is identical to an APT-only run. (A zero-init
+run-length embedding tagging each survivor with how many frames it stood in for
+used to live here; it was removed -- RLT drops the paper's equivalent for
+contributing little, and keeping it made TAPT's trained modules differ from
+APT's, confounding the comparison between them.)
 
 Everything through classification/run-length/origin-index is fully
 vectorized (see apt_temporal_static_tokens.py). The only per-scale looping
@@ -59,7 +63,7 @@ try:
         REDUNDANT, FRESH,
         dense_scale_code_grid, dirty_subtile_mask, shape_match_grid,
         cell_all_quiet, classify_cells, classification_stats,
-        compute_origin_index, compute_run_lengths,
+        compute_origin_index,
     )
 except ImportError:  # allow running this file directly as a script for testing
     from siglip_apt_embeddings import SiglipAPTEmbeddings
@@ -67,7 +71,7 @@ except ImportError:  # allow running this file directly as a script for testing
         REDUNDANT, FRESH,
         dense_scale_code_grid, dirty_subtile_mask, shape_match_grid,
         cell_all_quiet, classify_cells, classification_stats,
-        compute_origin_index, compute_run_lengths,
+        compute_origin_index,
     )
 
 
@@ -111,13 +115,8 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
             config.rlt_refresh_every -- see dirty_subtile_mask's docstring for
             why "ref" (diff against the carried reference, not frame t-1) is
             the correct default for a REDUNDANT run of any length.
-        max_frames: size of the run-length embedding table (a token can be
-            tagged with a run-length up to max_frames-1's worth of reuse).
-        reuse_len_embed: optional model-owned nn.Embedding (mirrors RLT's
-            phi_L sharing pattern exactly, siglip_rlt_embeddings.py:157-161)
-            -- stashed via __dict__ so this wrapper's own .to()/.cuda() can't
-            clone the shared, checkpoint-tracked copy. When None, a
-            standalone zero-init embedding is created (eval/testing only).
+    (No run-length embedding argument: TAPT carries no learnable temporal state,
+    matching plain RLT -- see the module docstring.)
 
     After each forward(), `self.last_stats` holds the classification diagnostics
     for the clip just encoded (see apt_temporal_static_tokens.classification_stats);
@@ -129,8 +128,6 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
         self,
         apt: SiglipAPTEmbeddings,
         threshold: float = 0.2,
-        max_frames: int = 512,
-        reuse_len_embed: Optional[nn.Module] = None,
         attn_mode: str = "reuse",
         mask_mode: str = "ref",
         refresh_every: int = 0,
@@ -138,19 +135,12 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
         super().__init__()
         self.apt = apt
         self.threshold = threshold
-        self.max_frames = max_frames
         assert attn_mode in ("reuse", "per_frame"), f"unknown attn_mode {attn_mode!r}"
         self.attn_mode = attn_mode
         assert mask_mode in ("ref", "consec"), f"unknown mask_mode {mask_mode!r}"
         self.mask_mode = mask_mode
         self.refresh_every = refresh_every
         self.last_stats: Dict[str, float] = {}
-
-        if reuse_len_embed is not None:
-            self.__dict__["reuse_len_embed"] = reuse_len_embed
-        else:
-            self.reuse_len_embed = nn.Embedding(max_frames, apt.embed_dim)
-            nn.init.zeros_(self.reuse_len_embed.weight)
 
     def _kv_rows_per_frame(self, origin_index: torch.Tensor, events_per_frame):
         """Per frame, the packed rows that make up its FULL partition.
@@ -278,7 +268,6 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
 
         is_new_token = cls == FRESH                    # == (cls != REDUNDANT)
         token_origin_frame = compute_origin_index(is_new_token)
-        run_length = compute_run_lengths(is_new_token)
 
         # ---- base-tile embedding: E(patch)+pos for every tile that belongs to a
         # FRESH cell. cls is uniform over each of frame t's own cells (shape_match
@@ -311,7 +300,7 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
             n_events = int(event_mask.sum().item())
             scale_events.append((event_mask, s))
 
-            # patch_attn / zero_conv / _embed_patches / reuse_len_embed are ZeRO-3-
+            # patch_attn / zero_conv / _embed_patches are ZeRO-3-
             # PARTITIONED: every call issues an all-gather. A rank whose clip happens to
             # have no cells at this scale must STILL issue them, in the same order, or the
             # collective sequence desyncs across ranks and the job deadlocks (NCCL
@@ -320,8 +309,9 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
             # same fix already applied inside siglip_apt_embeddings._embed.
             if s == 1:
                 # Base tiles were embedded unconditionally above, so this branch calls
-                # nothing partitioned of its own; the dummy exists only to keep the shared
-                # reuse_len_embed call below well-formed when the scale is empty.
+                # nothing partitioned of its own; the dummy only feeds a grad-free
+                # zero into zero3_pad, which is harmless because s==1 touches no
+                # partitioned module.
                 token_value = (tile_embed[event_mask] if n_events > 0        # (n_events, C)
                                else tile_embed.new_zeros(1, C))
             else:
@@ -369,24 +359,9 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
                     pos_for_events = pos_grid_ps.unsqueeze(0).expand(T, new_g, new_g, C)[event_mask]
                     token_value = token_value + pos_for_events.to(merged.dtype)
 
-            # reuse_len_embed is model-owned and trainable, hence ZeRO-3-partitioned too
-            # (llava_arch.get_apt_temporal_reuse_embed), so this call all-gathers it like
-            # the rest. It sits outside the s==1 / s>1 split deliberately: every scale
-            # must reach it exactly once on every rank. Skipping it for an empty scale --
-            # as both branches used to, via `continue` -- makes the gather count equal the
-            # number of NON-EMPTY scales, which is decided by frame entropy and so differs
-            # between ranks holding different clips. That is what deadlocked job 351066's
-            # successor at step ~6644.
-            if n_events > 0:
-                run_length_repr = run_length[:, ::s, ::s][event_mask]      # (n_events,)
-                length_idx = (run_length_repr - 1).clamp(min=0, max=self.reuse_len_embed.num_embeddings - 1)
-            else:
-                length_idx = torch.zeros(1, device=dev, dtype=torch.long)
-            token_value = token_value + self.reuse_len_embed(length_idx).to(token_value.dtype)
-
             if n_events == 0:
                 # Padding calls only. Fold them into the graph with weight 0 so
-                # patch_attn/zero_conv/reuse_len_embed stay reachable from the loss on
+                # patch_attn/zero_conv stay reachable from the loss on
                 # this rank -- a forward with no corresponding backward leaves their grad
                 # hooks unfired, desyncing the gradient reduce-scatter and reintroducing
                 # the very deadlock the unconditional calls exist to prevent.
@@ -477,7 +452,7 @@ if __name__ == "__main__":
     ).to(dev, dtype).eval()
 
     tapt = SiglipAPTTemporalEmbeddings(
-        apt, threshold=0.1, max_frames=16,   # 0.1: RLT's own default scale
+        apt, threshold=0.1,                  # 0.1: RLT's own default scale
     ).to(dev, dtype).eval()
 
     G = img // base_p
@@ -593,7 +568,6 @@ if __name__ == "__main__":
     #     is that property; this makes the reason explicit.
     assert float(apt.zero_conv.weight.abs().sum()) == 0.0, "zero_conv must be zero-init"
     assert float(apt.zero_conv.bias.abs().sum()) == 0.0, "zero_conv must be zero-init"
-    assert float(tapt.reuse_len_embed.weight.abs().sum()) == 0.0, "psi must be zero-init"
     print("OK: zero-init at the seam -> every TAPT token reduces to plain APT's "
           "E(Resize_p)+pos at step 0 (asserted value-for-value by tests 1-3).")
 

@@ -205,7 +205,6 @@ def apply_variant(model, method, use_sae, args):
     cfg.apt_thresholds = thr
     cfg.apt_num_scales = args.apt_num_scales
     cfg.apt_input_res  = args.apt_input_res
-    cfg.apt_temporal_max_frames     = args.apt_temporal_max_frames
 
 
 def reset_tallies(model):
@@ -407,7 +406,6 @@ def main():
                         help="Colon-separated per-scale thresholds, e.g. 4.0:6.0 (single value broadcasts)")
     parser.add_argument("--apt_num_scales", type=int, default=3)
     parser.add_argument("--apt_input_res",  type=int, default=392)
-    parser.add_argument("--apt_temporal_max_frames",     type=int,   default=512)
     parser.add_argument("--warmup",  type=int, default=1,
                         help="Warmup passes (first video, excluded from timings and tallies)")
     parser.add_argument("--runs",    type=int, default=1,

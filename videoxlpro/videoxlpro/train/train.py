@@ -148,7 +148,6 @@ class ModelArguments:
     # pixel scale, answering the identical question ("did this patch change vs.
     # the previous frame?"), so it's one shared knob, not two.
     use_apt_temporal: bool = field(default=False)
-    apt_temporal_max_frames: int = field(default=512, metadata={"help": "Size of the APT-Temporal run-length embedding table."})
 
 
 
@@ -323,14 +322,11 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         keys_to_match = ["mm_projector", "vision_resampler"]
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
-        # RLT has no learnable state of its own (only a fixed, scale-matched temporal
-        # position sinusoid), so there is nothing RLT-specific to add here.
-        # APT-Temporal's own run-length embedding still needs including, though.
-        if getattr(trainer.model.config, "use_apt_temporal", False):
-            keys_to_match.append("apt_temporal_reuse_embed")
-        # Same reasoning for APT's patch_attn/zero_conv -- also trainable (and so
-        # also needs saving) under use_apt_temporal, whose coarse tokens are APT's
-        # Eq. 2 verbatim (see siglip_apt_temporal_embeddings.py).
+        # Neither RLT nor APT-Temporal has learnable state of its own at the temporal
+        # seam, so there is nothing temporal-specific to add here. APT's patch_attn/
+        # zero_conv are trainable (and so need saving) under use_apt_temporal too,
+        # whose coarse tokens are APT's Eq. 2 verbatim (see
+        # siglip_apt_temporal_embeddings.py).
         if getattr(trainer.model.config, "use_apt", False) or getattr(trainer.model.config, "use_apt_temporal", False):
             keys_to_match.extend(["apt_patch_attn", "apt_zero_conv"])
 
@@ -1574,14 +1570,15 @@ class AptModuleNormCallback(transformers.TrainerCallback):
     `train/grad_norm` the Trainer already logs equals the APT grad norm here
     anyway, since these are the only trainable params.)
 
-    Targets (matched by name substring): apt_patch_attn / apt_zero_conv (plain
-    APT) and apt_temporal_reuse_embed (APT-Temporal). Under DeepSpeed Zero-3 these
+    Targets (matched by name substring): apt_patch_attn / apt_zero_conv -- the same
+    two modules under plain APT and APT-Temporal, since neither adds learnable
+    temporal state. Under DeepSpeed Zero-3 these
     params are sharded, so every read is gathered via GatheredParameters -- a
     collective, so ALL ranks run the gather (in the same param order) and only
     rank 0 records/logs; guarding the gather behind a rank check would deadlock.
     """
 
-    _KEYS = ("apt_patch_attn", "apt_zero_conv", "apt_temporal_reuse_embed")
+    _KEYS = ("apt_patch_attn", "apt_zero_conv")
 
     def __init__(self, model):
         self._model = model
@@ -1627,7 +1624,7 @@ class AptModuleNormCallback(transformers.TrainerCallback):
         # under LANG=C on HPC): ZC = zero_conv weight norm (the canary; starts at
         # exactly 0, so its norm IS its movement) and PA = patch_attn weight
         # distance travelled from init (its norm is ~constant, so the delta is the
-        # informative bit). RL = APT-Temporal run-length embed norm (temporal runs).
+        # informative bit).
         def pick(substr, which):
             for n, (wn, wd) in stats.items():
                 if substr in n and n.endswith(".weight"):
@@ -1637,13 +1634,10 @@ class AptModuleNormCallback(transformers.TrainerCallback):
         metrics, parts = {}, []
         zc = pick("apt_zero_conv", "norm")
         pa = pick("apt_patch_attn", "delta")
-        rl = pick("apt_temporal_reuse_embed", "norm")
         if zc is not None:
             metrics["apt/zc_wnorm"] = zc; parts.append(f"ZC_wnorm={zc:.3e}")
         if pa is not None:
             metrics["apt/pa_wdelta"] = pa; parts.append(f"PA_wdelta={pa:.3e}")
-        if rl is not None:
-            metrics["apt/reuse_wnorm"] = rl; parts.append(f"RL_wnorm={rl:.3e}")
 
         try:
             import wandb
@@ -1852,7 +1846,6 @@ def train(attn_implementation=None):
         # is config.rlt_threshold (set above) -- deliberately shared with RLT,
         # not a separate apt_temporal_* field (see ModelArguments comment).
         model.config.use_apt_temporal = model_args.use_apt_temporal
-        model.config.apt_temporal_max_frames = model_args.apt_temporal_max_frames
 
         ### Deciding train which part of the model
         if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
@@ -1938,14 +1931,6 @@ def train(attn_implementation=None):
                 f"zero_conv (shape={tuple(apt_zero_conv.weight.shape)}) registered and unfrozen."
             )
 
-        # APT-Temporal's run-length embedding: same reasoning as phi_L above.
-        if getattr(model.config, "use_apt_temporal", False):
-            tapt_reuse = model.get_model().get_apt_temporal_reuse_embed()
-            tapt_reuse.requires_grad_(True)
-            rank0_print(
-                f"[APT-Temporal] learnable run-length embedding registered "
-                f"(shape={tuple(tapt_reuse.weight.shape)}) and unfrozen."
-            )
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)

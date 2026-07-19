@@ -53,7 +53,6 @@ class VideoXLPro(lmms):
         apt_num_scales: Optional[int] = 3,
         apt_input_res: Optional[int] = 392,
         use_apt_temporal: Optional[bool] = False,
-        apt_temporal_max_frames: Optional[int] = 512,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -151,7 +150,6 @@ class VideoXLPro(lmms):
         # operate on the same SigLIP-normalized pixel scale, so it's one
         # shared knob rather than a second, differently-scaled threshold.
         self._model.config.use_apt_temporal = use_apt_temporal
-        self._model.config.apt_temporal_max_frames = apt_temporal_max_frames
         self.model.eval()
 
         self.batch_size_per_gpu = int(batch_size)

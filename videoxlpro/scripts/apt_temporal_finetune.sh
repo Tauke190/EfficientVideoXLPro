@@ -11,12 +11,14 @@ export WANDB_ENTITY="ag8093-university-of-central-florida"
 MODEL_PATH="MINT-SJTU/Video-XL-Pro-3B"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
-# The point of this run: zero_conv (merge correction) and reuse_len_embed (staleness tag)
-# are BOTH zero-initialised, so untrained APT-Temporal has its compensation switched off
-# entirely -- the coarse token is just a raw downsampled patch embed, and a reused token
-# carries no signal that it is stale. train.py unfreezes patch_attn / zero_conv /
-# reuse_len_embed automatically whenever use_apt_temporal is set, so this run is what
-# actually turns that compensation on.
+# The point of this run: zero_conv (merge correction) is zero-initialised, so untrained
+# APT-Temporal has its compensation switched off entirely -- the coarse token is just a
+# raw downsampled patch embed. train.py unfreezes patch_attn / zero_conv automatically
+# whenever use_apt_temporal is set, so this run is what actually turns that on.
+#
+# TAPT carries NO learnable temporal state, matching plain RLT: the trained modules here
+# are exactly the two APT trains, so an APT-only run and this one are directly
+# comparable and a result that holds for APT should transfer.
 #
 # THRESHOLD must match the eval script (lmms-eval/scripts/eval_videoxl_pro.sh). It sets how
 # much temporal reuse happens, hence how much there is to compensate FOR. Training at one
@@ -25,8 +27,8 @@ THRESHOLD=0.2
 
 # reuse = each frame's events attend over its FULL partition (fresh + carried tokens).
 # Train with `per_frame` ONLY for the ablation: it starves events of their own frame's
-# context, so zero_conv/reuse_len_embed would learn to compensate for that BUG as well as
-# for the legitimate reuse -- and the checkpoint is then invalid once the bug is fixed.
+# context, so zero_conv would learn to compensate for that BUG as well as for the
+# legitimate reuse -- and the checkpoint is then invalid once the bug is fixed.
 ATTN_MODE=reuse
 
 PROMPT_VERSION=qwen_1_5
@@ -66,7 +68,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --mm_patch_merge_type unires \
     --bf16 True \
     --run_name $MID_RUN_NAME \
-    --output_dir "/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/${MID_RUN_NAME}" \
+    --output_dir "/home/av354855/EfficientVideoXLPro/videoxlpro/outputs/checkpoints/${MID_RUN_NAME}" \
     --num_train_epochs 5 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
@@ -77,7 +79,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --save_total_limit 2 \
     --ddp_timeout 14400 \
     --mlvu_eval_on_save False \
-    --mlvu_eval_at_start True \
+    --mlvu_eval_at_start False \
     --mlvu_eval_frames 128 \
     --mlvu_eval_limit 100 \
     --mlvu_eval_timeout 10800 \

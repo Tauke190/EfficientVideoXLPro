@@ -176,7 +176,6 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
                 f"apt_num_scales={g('apt_num_scales', 3)}",
                 f"apt_input_res={g('apt_input_res', 392)}",
                 f"rlt_threshold={g('rlt_threshold', 0.2)}",
-                f"apt_temporal_max_frames={g('apt_temporal_max_frames', 512)}",
             ]
         elif g("use_rlt", False):
             # rlt_temporal_pos_scale must travel even though training and the wrapper now

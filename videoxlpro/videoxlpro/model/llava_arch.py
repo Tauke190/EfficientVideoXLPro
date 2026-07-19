@@ -49,12 +49,6 @@ class LlavaMetaModel:
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
 
-            if getattr(config, "use_apt_temporal", False):
-                # APT-Temporal's own learnable run-length embedding. Owned by the base
-                # model (not the unregistered APT wrapper) so trained checkpoints load
-                # its weight and DeepSpeed Zero-3 gathers it via its forward.
-                self.get_apt_temporal_reuse_embed()
-
             if getattr(config, "use_apt", False) or getattr(config, "use_apt_temporal", False):
                 # APT's trainable patch_attn/zero_conv, owned here (not inside the
                 # unregistered APT wrapper) so trained-APT checkpoints load their
@@ -102,23 +96,6 @@ class LlavaMetaModel:
         if type(vision_tower) is list:
             vision_tower = vision_tower[0]
         return vision_tower
-
-    def get_apt_temporal_reuse_embed(self):
-        """Learnable run-length embedding for APT-Temporal. Owned by the base model
-        (not the unregistered APT wrapper) so it appears in named_parameters() ->
-        optimizer + checkpoint and DeepSpeed Zero-3 gathers it via its forward.
-        Zero-init: enabling APT-Temporal's collapsing is a no-op bias at the
-        seam until fine-tuning learns the per-run-length bias. (Unlike RLT, which
-        adds no learnable state, APT-Temporal does train this table.)
-        """
-        if getattr(self, "apt_temporal_reuse_embed", None) is None:
-            vt = self.get_vision_tower()
-            dim = getattr(vt, "hidden_size", None) or self.config.mm_hidden_size
-            max_frames = getattr(self.config, "apt_temporal_max_frames", 512)
-            emb = nn.Embedding(max_frames, dim)
-            nn.init.zeros_(emb.weight)
-            self.apt_temporal_reuse_embed = emb.to(device=vt.device, dtype=vt.dtype)
-        return self.apt_temporal_reuse_embed
 
     def get_apt_patch_attn(self):
         """APT's trainable Conv2d^i (paper arXiv 2510.18091 Eq. 2, self.patch_attn).
@@ -549,8 +526,6 @@ class LlavaMetaForCausalLM(ABC):
             tapt = SiglipAPTTemporalEmbeddings(
                 apt,
                 threshold=getattr(self.config, "rlt_threshold", 0.2),
-                max_frames=getattr(self.config, "apt_temporal_max_frames", 512),
-                reuse_len_embed=self.get_model().get_apt_temporal_reuse_embed(),
                 # Shares RLT's knob: the starvation bug and its fix are the same in both
                 # (events attend over their frame's full partition, not just each other).
                 attn_mode=getattr(self.config, "rlt_attn_mode", "reuse"),
@@ -598,37 +573,26 @@ class LlavaMetaForCausalLM(ABC):
             total_dense += n_dense
             if tapt.last_stats:
                 clip_stats.append(tapt.last_stats)
-            rank0_print(
-                f"[APT-Temporal+DTS] clip={i} frames={T} "
-                f"encoder survivors={n_keep}/{n_dense} ({100.0*n_keep/n_dense:.1f}% kept) "
-                f"-> scatter-back to dense ({T}, {P}, C) -> DTS"
-            )
             dense_clips.append(apt_temporal_scatter_back(survivors, origin_index, T, P))
         # Keep grand-total counters live so the eval harness summary still works.
         self._apt_temporal_grand_keep = getattr(self, "_apt_temporal_grand_keep", 0) + total_keep
         self._apt_temporal_grand_dense = getattr(self, "_apt_temporal_grand_dense", 0) + total_dense
         self._apt_temporal_grand_videos = getattr(self, "_apt_temporal_grand_videos", 0) + len(per_clip_frames)
-        rank0_print(
-            f"[APT-Temporal+DTS] TOTAL encoder survivors={total_keep}/{total_dense} "
-            f"({100.0*total_keep/total_dense:.1f}% kept); DTS compresses the dense grid next."
-        )
         if clip_stats:
+            # Running totals only -- no per-forward logging, matching encode_clips_apt_dense
+            # (the RLT paths still log per forward). These fired on EVERY step, three lines
+            # per forward, which buries a multi-thousand-step training log. Rates stay
+            # recoverable:
+            # the eval harness reads _apt_temporal_stat_sum / _apt_temporal_stat_n and the
+            # grand-total counters above (lmms_eval/models/simple/videoxlpro.py,
+            # scripts/profile_encoder.py) and reports them once at the end, over many clips
+            # rather than one clip's noise.
             keys = clip_stats[0].keys()
-            avg = {k: sum(s[k] for s in clip_stats) / len(clip_stats) for k in keys}
-            # Running totals too, so a caller (eval harness / training callback) can
-            # report a stable rate over many clips rather than one clip's noise.
             prev = getattr(self, "_apt_temporal_stat_sum", {})
             self._apt_temporal_stat_sum = {
                 k: prev.get(k, 0.0) + sum(s[k] for s in clip_stats) for k in keys
             }
             self._apt_temporal_stat_n = getattr(self, "_apt_temporal_stat_n", 0) + len(clip_stats)
-            rank0_print(
-                f"[APT-Temporal] cells (frames 1..T-1): "
-                f"shape_match={100*avg['shape_match']:.1f}% all_quiet={100*avg['all_quiet']:.1f}% "
-                f"-> REDUNDANT={100*avg['redundant']:.1f}% (reused; the actual saving) | "
-                f"MISSED_REUSE={100*avg['missed_reuse']:.1f}% "
-                f"(unchanged but unreusable -- partition instability)"
-            )
         return tuple(dense_clips)
 
     @staticmethod
