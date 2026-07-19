@@ -44,6 +44,9 @@ class VideoXLPro(lmms):
         rlt_attn_mode: Optional[str] = "reuse",
         rlt_mask_mode: Optional[str] = "ref",
         rlt_refresh_every: Optional[int] = 0,
+        rlt_mask_space: Optional[str] = "pixel",
+        rlt_embed_threshold: Optional[float] = 0.34,
+        rlt_embed_metric: Optional[str] = "l2",
         use_apt: Optional[bool] = False,
         apt_threshold: Optional[str] = "4.0:6.0",
         apt_thresholds: Optional[str] = None,
@@ -106,6 +109,15 @@ class VideoXLPro(lmms):
         # (bounds drift); "consec" = legacy paper behaviour. refresh_every bounds staleness.
         self._model.config.rlt_mask_mode = rlt_mask_mode
         self._model.config.rlt_refresh_every = int(rlt_refresh_every)
+        # WHERE the drop test compares patches (orthogonal to rlt_mask_mode's WHAT it
+        # compares against). "pixel" = the paper's raw-pixel test; "embed" = distance
+        # between patch embeddings, which the patch-embed conv has already denoised.
+        # rlt_embed_threshold is its own scale, NOT interchangeable with rlt_threshold --
+        # and like rlt_threshold it must match whatever training used, since it sets how
+        # much reuse (hence how much distortion) the model is expected to compensate for.
+        self._model.config.rlt_mask_space = rlt_mask_space
+        self._model.config.rlt_embed_threshold = float(rlt_embed_threshold)
+        self._model.config.rlt_embed_metric = rlt_embed_metric
         # APT (spatial adaptive patches) and APT-Temporal (APT + temporal
         # redundancy collapsing on top) -- mutually exclusive with use_rlt
         # and with each other, so each method's gain is measured independently.

@@ -376,6 +376,13 @@ class LlavaMetaForCausalLM(ABC):
                 attn_mode=getattr(self.config, "rlt_attn_mode", "reuse"),
                 mask_mode=getattr(self.config, "rlt_mask_mode", "ref"),
                 refresh_every=getattr(self.config, "rlt_refresh_every", 0),
+                # Where the drop test compares patches. "embed" is NOT plumbed into
+                # APT-Temporal, which shares rlt_threshold/rlt_mask_mode but tests
+                # sub-tiles of raw pixels -- hence its own knob rather than a third
+                # rlt_mask_mode value that would be meaningless over there.
+                mask_space=getattr(self.config, "rlt_mask_space", "pixel"),
+                embed_threshold=getattr(self.config, "rlt_embed_threshold", 0.34),
+                embed_metric=getattr(self.config, "rlt_embed_metric", "l2"),
             )
             # NB: no blanket .to(device/dtype) here. The module aliases the
             # already-placed vision tower; temporal_pos is placed on-device inside
@@ -402,7 +409,8 @@ class LlavaMetaForCausalLM(ABC):
             total_keep += n_keep
             total_dense += n_dense
             rank0_print(
-                f"[RLT] video={i} frames={frames.shape[0]} threshold={rlt.threshold} "
+                f"[RLT] video={i} frames={frames.shape[0]} "
+                f"space={rlt.mask_space} threshold={rlt.active_threshold} "
                 f"survivors={n_keep}/{n_dense} ({100.0*n_keep/n_dense:.1f}% kept) "
                 f"-> LLM visual tokens={n_keep}"
             )
@@ -443,7 +451,8 @@ class LlavaMetaForCausalLM(ABC):
             total_dense += n_dense
             dense_clips.append(dense)
         rank0_print(
-            f"[RLT+DTS] mode={rlt.attn_mode} threshold={rlt.threshold} "
+            f"[RLT+DTS] mode={rlt.attn_mode} space={rlt.mask_space} "
+            f"threshold={rlt.active_threshold} "
             f"encoder tokens kept={total_keep}/{total_dense} "
             f"({100.0 * total_keep / max(total_dense, 1):.1f}% kept); DTS compresses the dense grid next."
         )

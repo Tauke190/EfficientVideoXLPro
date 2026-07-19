@@ -17,6 +17,9 @@ Pipeline (one clip of T frames):
         |
         |  SigLIP embeddings  -> (T, P, C)   spatial pos already baked in
         |  RLT keep-mask      -> drop temporally-redundant patch tokens
+        |    mask_space="pixel" -- test redundancy on raw pixels (the paper's test)
+        |    mask_space="embed" -- test it on the embeddings above, which is both
+        |                          noise-robust and the quantity reuse actually errs on
         v
     gather survivors (N, C)               # N <= T*P, in (t,h,w) order
         + temporal position[frame_t]*s     # fixed sinusoid, scaled to SigLIP pos RMS
@@ -53,12 +56,14 @@ try:
     from .rlt_static_tokens import (
         batched_find_idxs_to_keep,
         batched_find_idxs_to_keep_ref,
+        find_idxs_to_keep_embed,
         get_sinusoid_encoding,
     )
 except ImportError:  # allow running this file directly as a script for testing
     from rlt_static_tokens import (
         batched_find_idxs_to_keep,
         batched_find_idxs_to_keep_ref,
+        find_idxs_to_keep_embed,
         get_sinusoid_encoding,
     )
 
@@ -70,7 +75,7 @@ class SiglipRLTEmbeddings(nn.Module):
         vision_model: a transformers SiglipVisionModel (its .vision_model holds
             embeddings / encoder.layers / post_layernorm).
         threshold: RLT drop threshold (mean abs pixel change). Tune for the
-            normalized SigLIP input range.
+            normalized SigLIP input range. Used only when mask_space="pixel".
         patch_size: SigLIP patch size (14 for siglip-so400m-patch14-384).
         max_frames: size of the temporal position table.
         temporal_pos_scale: multiplier on the temporal-position magnitude AFTER it
@@ -78,6 +83,21 @@ class SiglipRLTEmbeddings(nn.Module):
             position enters at the same magnitude SigLIP uses for spatial position;
             <1.0 => a gentler complement; 0 => disabled. This is the only RLT-specific
             knob; RLT adds no learnable state at the seam.
+        mask_space: WHERE the redundancy test compares patches. Orthogonal to
+            mask_mode, which is WHAT reference it compares them against.
+            "pixel" (default, paper): mean abs change in raw normalized pixels.
+            "embed": distance between patch embeddings, after the patch-embed conv.
+                Robust to sensor noise / codec grain / lighting flicker, which the conv
+                averages out but a pixel diff cannot distinguish from real change. It
+                also measures the error reuse ACTUALLY incurs -- a dropped token reuses
+                an embedding, not pixels -- where the pixel test only proxies it. See
+                find_idxs_to_keep_embed.
+        embed_threshold: drop threshold for mask_space="embed". A SEPARATE knob from
+            `threshold` on purpose: that one is a pixel-scale value deliberately shared
+            with APT-Temporal's dirty-tile check (see llava_arch._get_apt_temporal_module),
+            and an embedding distance is not on that scale, so reusing it would silently
+            mean two different things in two places.
+        embed_metric: "l2" (default) or "cosine"; see find_idxs_to_keep_embed.
     """
 
     def __init__(
@@ -91,6 +111,9 @@ class SiglipRLTEmbeddings(nn.Module):
         attn_mode: str = "reuse",
         mask_mode: str = "ref",
         refresh_every: int = 0,
+        mask_space: str = "pixel",
+        embed_threshold: float = 0.34,
+        embed_metric: str = "l2",
     ) -> None:
         super().__init__()
         self.vision_model = vision_model
@@ -109,6 +132,11 @@ class SiglipRLTEmbeddings(nn.Module):
         assert mask_mode in ("ref", "consec"), f"unknown mask_mode {mask_mode!r}"
         self.mask_mode = mask_mode
         self.refresh_every = refresh_every
+        assert mask_space in ("pixel", "embed"), f"unknown mask_space {mask_space!r}"
+        self.mask_space = mask_space
+        self.embed_threshold = embed_threshold
+        assert embed_metric in ("l2", "cosine"), f"unknown embed_metric {embed_metric!r}"
+        self.embed_metric = embed_metric
         # Video-XL-Pro consumes SigLIP's hidden_states[-1] (the last encoder layer
         # output, BEFORE post_layernorm). Default off to match that; the projector
         # was trained on pre-LN features.
@@ -126,6 +154,58 @@ class SiglipRLTEmbeddings(nn.Module):
         # NOTE: the paper's learnable run-length encoding phi_L is deliberately NOT
         # used -- the paper reports it contributes little, and RLT here adds only the
         # scale-matched fixed temporal position above. No trainable state at the seam.
+
+    @property
+    def active_threshold(self) -> float:
+        """The threshold actually in force, given mask_space. For logging."""
+        return self.embed_threshold if self.mask_space == "embed" else self.threshold
+
+    def _pixel_keep_mask(self, pixel_values: torch.Tensor, T: int, P: int) -> torch.Tensor:
+        """Keep-mask from raw pixels (the paper's test). Returns (T*P,) bool.
+
+        tubelet_size=1 throughout: SigLIP is a 2D encoder, so a token is one frame deep.
+          "ref"    -- diff each patch against the frame its features will actually be
+                      REUSED from, so drift is bounded by `threshold` by construction.
+          "consec" -- legacy/paper: diff against frame t-1 while reusing from the last
+                      SURVIVING frame. Those are different references, so slow drift is
+                      never detected and accumulates without bound. Kept for ablation.
+        """
+        x5d = pixel_values.permute(1, 0, 2, 3).unsqueeze(0)            # (1, C, T, H, W)
+        if self.mask_mode == "ref":
+            token_mask = batched_find_idxs_to_keep_ref(
+                x5d, threshold=self.threshold, patch_size=self.patch_size,
+                refresh_every=self.refresh_every,
+            )
+        else:
+            token_mask = batched_find_idxs_to_keep(
+                x5d, threshold=self.threshold, tubelet_size=1, patch_size=self.patch_size
+            )                                                          # (1, T*h*w)
+        n_per_frame = token_mask.shape[1] // T
+        assert P == n_per_frame, (
+            f"SigLIP grid ({P}) != RLT keep-mask grid ({n_per_frame}); "
+            f"check patch_size / image_size alignment."
+        )
+        return token_mask.reshape(-1)                                  # (T*P,)
+
+    def _embed_keep_mask(self, emb: torch.Tensor) -> torch.Tensor:
+        """Keep-mask from patch embeddings. Returns (T*P,) bool.
+
+        Strips SigLIP's spatial position embedding first: it is constant per slot, so it
+        carries no content, but it does not cancel under the metric's norms (only under
+        the raw difference). Read through the module forward, as HF does, so DeepSpeed
+        Zero-3 gathers the sharded weight via the nn.Embedding hook.
+
+        Detached: a keep-mask is discrete, so nothing differentiable passes through it.
+        """
+        sp = self.embeddings.position_embedding(self.embeddings.position_ids)  # (1,P,C)
+        patch_only = emb.detach() - sp.detach()                                # (T,P,C)
+        return find_idxs_to_keep_embed(
+            patch_only,
+            threshold=self.embed_threshold,
+            metric=self.embed_metric,
+            mask_mode=self.mask_mode,
+            refresh_every=self.refresh_every,
+        )
 
     @staticmethod
     def _carry_idx(mask2d: torch.Tensor) -> torch.Tensor:
@@ -276,38 +356,21 @@ class SiglipRLTEmbeddings(nn.Module):
         T = pixel_values.shape[0]
         dev, dtype = pixel_values.device, pixel_values.dtype
 
-        # 1. RLT keep-mask from raw pixels. tubelet_size=1 (SigLIP is a 2D encoder, so a
-        #    token is one frame deep).
-        #      "ref"    -- diff each patch against the frame its features will actually be
-        #                  REUSED from, so drift is bounded by `threshold` by construction.
-        #      "consec" -- legacy/paper: diff against frame t-1 while reusing from the last
-        #                  SURVIVING frame. Those are different references, so slow drift is
-        #                  never detected and accumulates without bound. Kept for ablation.
-        x5d = pixel_values.permute(1, 0, 2, 3).unsqueeze(0)            # (1, C, T, H, W)
-        if self.mask_mode == "ref":
-            token_mask = batched_find_idxs_to_keep_ref(
-                x5d, threshold=self.threshold, patch_size=self.patch_size,
-                refresh_every=self.refresh_every,
-            )
-        else:
-            token_mask = batched_find_idxs_to_keep(
-                x5d, threshold=self.threshold, tubelet_size=1, patch_size=self.patch_size
-            )                                                          # (1, T*h*w)
-        n_per_frame = token_mask.shape[1] // T
-        h = w = int(round(n_per_frame ** 0.5))
-
-        # 2. SigLIP patch-embed (+ spatial pos baked in). (T, P, C)
+        # 1. SigLIP patch-embed (+ spatial pos baked in). (T, P, C). Runs FIRST because
+        #    mask_space="embed" tests redundancy on these embeddings; the pixel test does
+        #    not need them, but the encoder does either way, so nothing is computed twice.
         emb = self.embeddings(pixel_values)
         P = emb.shape[1]
-        assert P == n_per_frame, (
-            f"SigLIP grid ({P}) != RLT keep-mask grid ({n_per_frame}); "
-            f"check patch_size / image_size alignment."
-        )
 
-        # 3. Keep-mask in (t,h,w) order.
-        mask_flat = token_mask.reshape(-1)                            # (T*P,)
+        # 2. RLT keep-mask, (T*P,) bool in (t,h,w) order. mask_space picks WHERE patches
+        #    are compared (raw pixels vs. patch embeddings); mask_mode, handled inside
+        #    both, picks WHAT reference they are compared against.
+        if self.mask_space == "embed":
+            mask_flat = self._embed_keep_mask(emb)
+        else:
+            mask_flat = self._pixel_keep_mask(pixel_values, T, P)
 
-        # 4. Optionally add a FIXED temporal position phi_t (which frame each token came
+        # 3. Optionally add a FIXED temporal position phi_t (which frame each token came
         #    from), scaled to the RMS of SigLIP's own position_embedding so it enters at
         #    the magnitude SigLIP uses for position. The scale is DETACHED (it only
         #    rescales a frozen sinusoid), so RLT still adds no trainable state.
@@ -330,7 +393,7 @@ class SiglipRLTEmbeddings(nn.Module):
 
         survivors = emb_pos.reshape(T * P, self.embed_dim)[mask_flat]      # (N, C)
 
-        # 5. Encode. Attention is WITHIN-frame in both modes: SigLIP is a 2D image encoder
+        # 4. Encode. Attention is WITHIN-frame in both modes: SigLIP is a 2D image encoder
         #    whose weights were trained with within-frame attention, and Video-XL-Pro
         #    defers whole-video reasoning to the DTS/SAE stack and the LLM. The modes
         #    differ only in what each frame's survivors are allowed to attend TO.
@@ -379,25 +442,42 @@ if __name__ == "__main__":
     frames = base.repeat(T, 1, 1, 1)
     frames[3:, :, :patch, :patch] += 5.0
 
-    def build(mode, thr=0.1):
+    def build(mode, thr=0.1, space="pixel", metric="l2"):
         return SiglipRLTEmbeddings(vm, threshold=thr, patch_size=patch, max_frames=64,
-                                   temporal_pos_scale=0.0, attn_mode=mode).to(dev, dtype).eval()
+                                   temporal_pos_scale=0.0, attn_mode=mode,
+                                   mask_space=space, embed_threshold=thr,
+                                   embed_metric=metric).to(dev, dtype).eval()
 
-    for mode in ("reuse", "per_frame"):
-        dense, mask_flat = build(mode)(frames)
-        N = int(mask_flat.sum())
-        print(f"{mode:<10} dense: {tuple(dense.shape)}  (survivors N={N} of {T*P})")
-        assert dense.shape == (T, P, cfg.hidden_size)
-        assert torch.isfinite(dense.float()).all(), "non-finite outputs from xformers attention"
+    for space in ("pixel", "embed"):
+        for mode in ("reuse", "per_frame"):
+            dense, mask_flat = build(mode, space=space)(frames)
+            N = int(mask_flat.sum())
+            print(f"{space:<6} {mode:<10} dense: {tuple(dense.shape)}  (survivors N={N} of {T*P})")
+            assert dense.shape == (T, P, cfg.hidden_size)
+            assert torch.isfinite(dense.float()).all(), "non-finite outputs from xformers attention"
 
     # The load-bearing invariant: with nothing dropped, RLT must be a no-op. Anything
     # else means the carried keys/values are not what the dense model would compute.
     truth = vm(frames, output_hidden_states=True).hidden_states[-1]      # (T, P, C)
-    for mode in ("reuse", "per_frame"):
-        dense, mask_flat = build(mode, thr=-1.0)(frames)                 # keep everything
-        assert bool(mask_flat.all()), "threshold=-1 must keep every token"
-        err = (dense.float() - truth.float()).abs().max().item()
-        assert err < 1e-2, f"{mode}: 100% keep must reduce to dense SigLIP, got max|err|={err}"
-        print(f"{mode:<10} 100% keep reproduces dense SigLIP (max|err|={err:.2e})")
+    for space in ("pixel", "embed"):
+        for mode in ("reuse", "per_frame"):
+            dense, mask_flat = build(mode, thr=-1.0, space=space)(frames)   # keep everything
+            assert bool(mask_flat.all()), "threshold=-1 must keep every token"
+            err = (dense.float() - truth.float()).abs().max().item()
+            assert err < 1e-2, f"{space}/{mode}: 100% keep must reduce to dense SigLIP, max|err|={err}"
+            print(f"{space:<6} {mode:<10} 100% keep reproduces dense SigLIP (max|err|={err:.2e})")
 
+    # Both spaces must still SEE the real change: the top-left patch jumps at t=3, so it
+    # must be kept there. A mask that drops it has thresholded away the signal, not noise.
+    for space, thr in (("pixel", 0.1), ("embed", 0.05)):
+        _, m = build("reuse", thr=thr, space=space)(frames)
+        assert bool(m.view(T, P)[3, 0]), f"{space}: must keep the top-left patch that jumps at t=3"
+    print("\nboth spaces detect the real change at t=3")
+
+    # NOTE: this file's noise-robustness rationale for mask_space="embed" is deliberately
+    # NOT asserted here. It rests on the patch-embed conv suppressing noise while passing
+    # structure, which is a property of TRAINED filters; this tiny SigLIP has random ones,
+    # so a noise test on it would measure nothing and could only mislead. Measure the
+    # keep-rate/threshold curve on the real checkpoint instead --
+    # lmms-eval/scripts/profile_encoder.py --rlt_mask_space embed --rlt_embed_threshold X.
     print("\nOK: SigLIP-RLT embeddings run end-to-end and are exact at 100% keep.")

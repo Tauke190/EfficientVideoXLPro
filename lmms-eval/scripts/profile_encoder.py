@@ -192,6 +192,11 @@ def apply_variant(model, method, use_sae, args):
     cfg.rlt_attn_mode          = args.rlt_attn_mode
     cfg.rlt_mask_mode          = args.rlt_mask_mode
     cfg.rlt_refresh_every      = int(args.rlt_refresh_every)
+    # mask_space and its threshold are RLT-only -- APT-Temporal tests sub-tiles of raw
+    # pixels, so it ignores these and keeps reading rlt_threshold.
+    cfg.rlt_mask_space         = args.rlt_mask_space
+    cfg.rlt_embed_threshold    = float(args.rlt_embed_threshold)
+    cfg.rlt_embed_metric       = args.rlt_embed_metric
     thr = [float(p) for p in str(args.apt_threshold).replace(",", ":").split(":") if p != ""]
     n_needed = int(args.apt_num_scales) - 1
     if len(thr) == 1:
@@ -385,6 +390,15 @@ def main():
                              "(SAE already carries temporal info); >0 only for the ragged path.")
     parser.add_argument("--rlt_attn_mode", choices=["reuse", "per_frame"], default="reuse",
                         help="'reuse' = survivors attend over the full frame; 'per_frame' = legacy starved attention")
+    parser.add_argument("--rlt_mask_space", choices=["pixel", "embed"], default="pixel",
+                        help="Where the RLT drop test compares patches: 'pixel' (paper) or "
+                             "'embed' (patch embeddings; noise-robust). Uses "
+                             "--rlt_embed_threshold, NOT --rlt_threshold. RLT only.")
+    parser.add_argument("--rlt_embed_threshold", type=float, default=0.34,
+                        help="Drop threshold for --rlt_mask_space embed. Separate scale from "
+                             "--rlt_threshold; calibrate against a target keep rate.")
+    parser.add_argument("--rlt_embed_metric", choices=["l2", "cosine"], default="l2",
+                        help="How --rlt_mask_space embed compares patch embeddings.")
     parser.add_argument("--rlt_mask_mode", choices=["ref", "consec"], default="ref",
                         help="Dirty-check reference frame: 'ref' (bounds drift) or 'consec' (legacy)")
     parser.add_argument("--rlt_refresh_every", type=int, default=0,

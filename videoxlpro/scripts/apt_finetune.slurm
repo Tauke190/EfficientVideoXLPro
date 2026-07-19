@@ -89,7 +89,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --data_path /home/av354855/EfficientVideoXLPro/data_mix.yaml \
     --image_folder /home/c3-0/datasets/llava_665K/playground/data \
     --video_folder /home/c3-0/datasets/Ego4D/videos/h264 \
-    --mm_tunable_parts="none" \
+    --mm_tunable_parts="mm_mlp_adapter,mm_temporal_compressor" \
     --frames_upbound 32 \
     --video_fps 1 \
     --vision_tower ${VISION_MODEL_VERSION} \
@@ -113,7 +113,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 4 \
     --save_strategy "steps" \
-    --save_steps 3000 \
+    --save_steps 2000 \
     --save_total_limit 2 \
     --mlvu_eval_on_save True \
     --mlvu_eval_at_start False \
@@ -130,7 +130,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --tf32 True \
     --model_max_length 32768 \
     --gradient_checkpointing False \
-    --dataloader_num_workers 0 \
+    --dataloader_num_workers 4 \
     --lazy_preprocess True \
     --report_to wandb \
     --dataloader_drop_last True \

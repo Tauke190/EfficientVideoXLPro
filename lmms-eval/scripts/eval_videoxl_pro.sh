@@ -29,15 +29,17 @@ LOG_FILE="$LOG_DIR/eval_apttemporal_$(date +%Y%m%d_%H%M%S).log"
 #   "attn_implementation=flash_attention_2"
 #   )
 
-args=(
-  "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-apt-llava-ego4D/checkpoint-10000"
-  "max_frames_num=128"
-  "use_apt=True"
-  "apt_num_scales=3"
-  "apt_threshold=4.0:6.0"
-  "attn_implementation=flash_attention_2"
-  )
+# args=(
+#   "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-apt-llava-ego4D/checkpoint-10000"
+#   # "pretrained=MINT-SJTU/Video-XL-Pro-3B"
+#   "max_frames_num=128"
+#   "use_apt=True"
+#   "apt_num_scales=3"
+#   "apt_threshold=4.0:6.0"
+#   "attn_implementation=flash_attention_2"
+#   )
 
+  # RLT in pixel space
   # args=(
   # "pretrained=MINT-SJTU/Video-XL-Pro-3B"
   # "max_frames_num=128"
@@ -48,15 +50,29 @@ args=(
   # "attn_implementation=flash_attention_2"
   # )
 
+
+  # RLT in embedding space
   # args=(
-  # "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-apt-llava-ego4D-short-finetune/checkpoint-6000"
-  # "max_frames_num=128"
-  # "use_apt_temporal=True"
-  # "apt_threshold=4.0:6.0"
-  # "rlt_threshold=0.2"
-  # "rlt_attn_mode=reuse"
-  # "attn_implementation=flash_attention_2"
+  #   "pretrained=MINT-SJTU/Video-XL-Pro-3B"
+  #   "max_frames_num=128"
+  #   "use_rlt=True"
+  #   "rlt_mask_space=embed"
+  #   "rlt_embed_threshold=0.34"
+  #   "rlt_embed_metric=l2"
+  #   "rlt_attn_mode=reuse"
+  #   "attn_implementation=flash_attention_2"
   # )
+
+
+  args=(
+  "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-temporal-apt-llava-ego4D"
+  "max_frames_num=128"
+  "use_apt_temporal=True"
+  "apt_threshold=4.0:6.0"
+  "rlt_threshold=0.2"
+  "rlt_attn_mode=reuse"
+  "attn_implementation=flash_attention_2"
+  )
 MODEL_ARGS=$(IFS=,; echo "${args[*]}")
 
 # datasets = [mlvu_test , egoschema_subset]
@@ -64,7 +80,7 @@ MODEL_ARGS=$(IFS=,; echo "${args[*]}")
 accelerate launch --num_processes=3 --main_process_port 12345 \
     -m lmms_eval \
     --model videoxlpro \
-    --tasks mlvu_dev \
+    --tasks mlvu_test \
     --model_args "$MODEL_ARGS" \
     --batch_size 1 \
     --log_samples \
@@ -98,7 +114,7 @@ echo "========================================"
 # 200 - 22
 # All - 47.4
 
-# Num of sample at 128 frames With RLT and SAE enabled 9 ( 55 % of token dropped in encoding)
+# Num of sample at 128 frames With RLT and SAE enabled  ( 55 % of token dropped in encoding)
 # 100 - 9.47
 # 200 - 11.93
 # All - 

@@ -187,6 +187,13 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
                 "use_rlt=True",
                 f"rlt_threshold={g('rlt_threshold', 0.2)}",
                 f"rlt_temporal_pos_scale={g('rlt_temporal_pos_scale', 0.0)}",
+                # Same trap as rlt_threshold, one level up: the wrapper defaults to
+                # mask_space="pixel", so a run trained with "embed" would otherwise be
+                # evaluated with an entirely different drop rule -- and rlt_embed_threshold
+                # is on its own scale, so it cannot fall back to rlt_threshold either.
+                f"rlt_mask_space={g('rlt_mask_space', 'pixel')}",
+                f"rlt_embed_threshold={g('rlt_embed_threshold', 0.34)}",
+                f"rlt_embed_metric={g('rlt_embed_metric', 'l2')}",
             ]
         return ",".join(args)
 

@@ -168,6 +168,110 @@ def batched_find_idxs_to_keep_ref(
     return keep.flatten(1)                  # (B, T*h*w), (t,h,w) order
 
 
+@torch.no_grad()
+def find_idxs_to_keep_embed(
+    emb: torch.Tensor,
+    threshold: float = 0.34,
+    metric: str = "l2",
+    mask_mode: str = "ref",
+    refresh_every: int = 0,
+) -> torch.Tensor:
+    """Keep-mask computed on PATCH EMBEDDINGS instead of raw pixels.
+
+    Same carried-reference semantics as batched_find_idxs_to_keep_ref, but the
+    redundancy test asks "did SigLIP's view of this patch change?" rather than "did
+    its pixels change?". The patch-embed conv reduces 14x14x3 = 588 pixels to C
+    features through learned filters, so i.i.d. sensor noise (and JPEG/codec ringing,
+    and sub-threshold lighting flicker) largely averages out, while the structured
+    changes the encoder is sensitive to survive. A pixel-space test cannot separate
+    those: it sees only total intensity change, so grain forces a keep and a
+    low-contrast but semantically real change does not.
+
+    This is also the *right* quantity to threshold. A dropped token reuses the
+    surviving token's EMBEDDING, so the error reuse actually incurs is the embedding
+    distance -- which is what is measured here -- while the pixel distance is only a
+    proxy for it, and a loose one wherever the patch-embed filters are not locally
+    linear in pixel space.
+
+    Costs one extra pass over the (already computed) embeddings; the patch-embed conv
+    is not run twice.
+
+    Args:
+        emb: (T, P, C) patch embeddings for ONE clip, with SigLIP's spatial position
+            embedding ALREADY REMOVED. Position is constant per slot p, so it cancels
+            in any difference, but it does NOT cancel under the norms that `metric`
+            takes -- leaving it in would make sensitivity vary by grid position, and
+            would inflate cosine similarity by a shared component carrying no content.
+        threshold: distance above which a patch is kept. NOT on the pixel scale of
+            rlt_threshold -- see `metric` for what each scale means. The defaults are
+            calibrated to hold the KEEP RATE fixed against the pixel test's own default,
+            so that flipping mask_space changes the drop rule and not the amount of
+            reuse (measured on 5 MLVU videos x 128 frames, mask_mode="ref"):
+                pixel  thr=0.2   -> 56.9% keep   (the pixel default)
+                l2     thr=0.34  -> 55.7% keep
+                cosine thr=0.022 -> 57.2% keep
+            Keep rate is strongly content-dependent (those 5 videos individually span
+            23-74% at the pixel default), so recalibrate on your own footage before
+            reading anything into a threshold transplanted from elsewhere.
+        metric: how patch embeddings are compared.
+            "l2" (default): euclidean distance, divided by the clip's mean patch-embed
+                norm. Dimensionless, so the threshold reads as "fraction of a typical
+                patch's magnitude" and transfers across SigLIP variants.
+            "cosine": 1 - cos_sim, i.e. direction only. Invariant to any per-patch gain
+                (exposure/contrast drift changes magnitude, not direction), but it
+                amplifies noise in low-norm patches -- flat regions like sky have small
+                embeddings whose direction wanders freely, so they are over-kept.
+        mask_mode: "ref" (default) diffs against the embedding each patch will actually
+            be REUSED from, bounding drift by `threshold` by construction. "consec"
+            diffs against frame t-1 while still reusing from the last SURVIVING frame,
+            reproducing the reference implementation's mismatch. Same distinction, and
+            the same reasoning, as batched_find_idxs_to_keep_ref's docstring.
+        refresh_every: if > 0, force-keep every Nth frame. 0 disables.
+
+    Returns:
+        keep_idxs: (T*P,) bool, True = keep, in (t, h, w) raster order -- the same
+            layout batched_find_idxs_to_keep_ref returns for (B=1).
+    """
+    assert emb.dim() == 3, f"emb must be (T, P, C), got {tuple(emb.shape)}"
+    assert metric in ("l2", "cosine"), f"unknown metric {metric!r}"
+    assert mask_mode in ("ref", "consec"), f"unknown mask_mode {mask_mode!r}"
+    T, P, _ = emb.shape
+    dev = emb.device
+
+    # Distances between near-identical vectors cancel most of their significant bits,
+    # which fp16 does not have to spare; the whole test lives in that cancellation.
+    if metric == "l2":
+        # Reduce in fp32 without materializing an fp32 copy of the full (T,P,C) tensor.
+        scale = torch.linalg.vector_norm(
+            emb, dim=-1, dtype=torch.float32
+        ).mean().clamp_min(1e-6)
+
+    def _prep(t: int) -> torch.Tensor:
+        f = emb[t].float()
+        return f / scale if metric == "l2" else F.normalize(f, dim=-1)
+
+    keep = torch.zeros(T, P, dtype=torch.bool, device=dev)
+    keep[0] = True                          # RLT always keeps all of frame 0
+    ref = _prep(0)                          # (P, C) embedding each patch carries
+
+    for t in range(1, T):
+        cur = _prep(t)
+        if refresh_every and t % refresh_every == 0:
+            k = torch.ones(P, dtype=torch.bool, device=dev)
+        else:
+            if metric == "l2":
+                d = (cur - ref).norm(dim=-1)                # (P,)
+            else:
+                d = 1.0 - (cur * ref).sum(-1)               # both already unit-norm
+            k = d > threshold
+        keep[t] = k
+        # Refresh the reference ONLY where the patch survived; dropped patches keep
+        # carrying the embedding their features were actually computed from.
+        ref = torch.where(k.unsqueeze(-1), cur, ref) if mask_mode == "ref" else cur
+
+    return keep.reshape(-1)                 # (T*P,), (t,h,w) order
+
+
 if __name__ == "__main__":
     # ---- self-test on a controlled synthetic clip --------------------------
     torch.manual_seed(0)
