@@ -53,6 +53,11 @@ class VideoXLPro(lmms):
         apt_num_scales: Optional[int] = 3,
         apt_input_res: Optional[int] = 392,
         use_apt_temporal: Optional[bool] = False,
+        apt_temporal_window: Optional[int] = 1,
+        apt_temporal_cut_threshold: Optional[float] = 0.8,
+        apt_temporal_partition_mode: Optional[str] = "entropy",
+        apt_temporal_run_tol: Optional[int] = 0,
+        apt_temporal_persist: Optional[bool] = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -150,6 +155,16 @@ class VideoXLPro(lmms):
         # operate on the same SigLIP-normalized pixel scale, so it's one
         # shared knob rather than a second, differently-scaled threshold.
         self._model.config.use_apt_temporal = use_apt_temporal
+        # Windowed partition: apt_temporal_window=1 (default) is the per-frame
+        # partition, i.e. unchanged behaviour. See train.py's help text.
+        self._model.config.apt_temporal_window = int(apt_temporal_window)
+        self._model.config.apt_temporal_cut_threshold = float(apt_temporal_cut_threshold)
+        # 'survivor' builds the partition from RLT survivorship instead of entropy.
+        self._model.config.apt_temporal_partition_mode = apt_temporal_partition_mode
+        self._model.config.apt_temporal_run_tol = int(apt_temporal_run_tol)
+        # Carry a merged cell forward while its contents stay quiet, instead of
+        # letting it fragment (and pay a fresh re-encode) the moment motion stops.
+        self._model.config.apt_temporal_persist = apt_temporal_persist
         self.model.eval()
 
         self.batch_size_per_gpu = int(batch_size)
@@ -346,8 +361,42 @@ class VideoXLPro(lmms):
             gd = getattr(self.model, "_apt_temporal_grand_dense", 0)
             gv = getattr(self.model, "_apt_temporal_grand_videos", 0)
             if gd > 0:
+                # Report WHICH dirty test produced these numbers. pixel and embed
+                # keep rates are not comparable on face value (the thresholds are on
+                # different scales), so an ablation whose summary doesn't say which
+                # one ran is unreadable after the fact.
+                tapt = self.model.__dict__.get("_apt_temporal_module", None)
+                space = getattr(tapt, "mask_space", "pixel")
+                thr = getattr(tapt, "active_threshold", None)
+                cfg_line = f"[APT-Temporal] dirty test: space={space} threshold={thr}"
+                if space == "embed":
+                    cfg_line += f" metric={getattr(tapt, 'embed_metric', 'l2')}"
+                # WHICH partition rule ran. 'survivor' and 'entropy' produce very
+                # different scale mixes at similar keep rates, so a summary that
+                # omits this makes two runs indistinguishable after the fact.
+                pmode = getattr(tapt, "partition_mode", "entropy")
+                cfg_line += f"\n[APT-Temporal] partition: mode={pmode}"
+                if pmode == "survivor":
+                    cfg_line += (f" run_tol={getattr(tapt, 'run_tol', 0)}"
+                                 f" persist={getattr(tapt, 'persist', False)}")
+                else:
+                    win = getattr(tapt, "window", 1)
+                    cfg_line += f" window={win}"
+                    if win > 1:
+                        cfg_line += f" cut_threshold={getattr(tapt, 'cut_threshold', 0.8)}"
+                # missed_reuse is the number the windowed partition exists to
+                # recover -- cells that did not change but could not be carried
+                # forward. At window=1 it IS the upper bound on what windowing
+                # can buy, so it has to be readable from an eval run, not just
+                # from profile_encoder.py.
+                ssum = getattr(self.model, "_apt_temporal_stat_sum", None) or {}
+                sn = getattr(self.model, "_apt_temporal_stat_n", 0)
+                if ssum and sn:
+                    rates = "  ".join(f"{k}={v / sn:.3f}" for k, v in sorted(ssum.items()))
+                    cfg_line += f"\n[APT-Temporal] cells: {rates}  (over {sn} clips)"
                 print(
                     f"\n[APT-Temporal] ===== GRAND TOTAL =====\n"
+                    f"{cfg_line}\n"
                     f"[APT-Temporal] videos={gv}  encoder tokens kept={gk}/{gd} ({100.0*gk/gd:.1f}%)\n"
                     f"[APT-Temporal] avg encoder survivors/video={gk//gv if gv else 0}\n"
                     f"[APT-Temporal] ==========================\n",

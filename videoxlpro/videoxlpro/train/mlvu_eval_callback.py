@@ -159,6 +159,17 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
             args += [
                 f"rlt_attn_mode={g('rlt_attn_mode', 'reuse')}",
                 f"rlt_mask_mode={g('rlt_mask_mode', 'ref')}",
+                f"rlt_refresh_every={g('rlt_refresh_every', 0)}",
+                # mask_space and its threshold now drive APT-Temporal's dirty-tile
+                # check as well as RLT's drop test, so they belong in this SHARED
+                # block. They used to sit in the use_rlt branch alone, back when
+                # APT-Temporal was pixel-only -- which meant a run trained with
+                # use_apt_temporal + embed was silently evaluated with the wrapper's
+                # "pixel" default, i.e. a different drop rule entirely. Same trap the
+                # docstring above warns about, one method over.
+                f"rlt_mask_space={g('rlt_mask_space', 'pixel')}",
+                f"rlt_embed_threshold={g('rlt_embed_threshold', 0.34)}",
+                f"rlt_embed_metric={g('rlt_embed_metric', 'l2')}",
             ]
         # lmms_eval splits --model_args on commas, so threshold lists travel colon-separated.
         thresholds = ":".join(str(t) for t in (g("apt_thresholds") or []))
@@ -176,6 +187,17 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
                 f"apt_num_scales={g('apt_num_scales', 3)}",
                 f"apt_input_res={g('apt_input_res', 392)}",
                 f"rlt_threshold={g('rlt_threshold', 0.2)}",
+                # WHAT the partition is built from. The wrapper defaults to
+                # "entropy", so a run trained with "survivor" (partition from RLT
+                # survivorship rather than spatial flatness) would otherwise be
+                # evaluated with a completely different token-reduction method --
+                # different scale mix, different keep rate, different everything.
+                # run_tol/persist/window shape that partition, so they travel too.
+                f"apt_temporal_partition_mode={g('apt_temporal_partition_mode', 'entropy')}",
+                f"apt_temporal_run_tol={g('apt_temporal_run_tol', 0)}",
+                f"apt_temporal_persist={g('apt_temporal_persist', False)}",
+                f"apt_temporal_window={g('apt_temporal_window', 1)}",
+                f"apt_temporal_cut_threshold={g('apt_temporal_cut_threshold', 0.8)}",
             ]
         elif g("use_rlt", False):
             # rlt_temporal_pos_scale must travel even though training and the wrapper now
@@ -186,13 +208,8 @@ class MLVUCheckpointEvalCallback(transformers.TrainerCallback):
                 "use_rlt=True",
                 f"rlt_threshold={g('rlt_threshold', 0.2)}",
                 f"rlt_temporal_pos_scale={g('rlt_temporal_pos_scale', 0.0)}",
-                # Same trap as rlt_threshold, one level up: the wrapper defaults to
-                # mask_space="pixel", so a run trained with "embed" would otherwise be
-                # evaluated with an entirely different drop rule -- and rlt_embed_threshold
-                # is on its own scale, so it cannot fall back to rlt_threshold either.
-                f"rlt_mask_space={g('rlt_mask_space', 'pixel')}",
-                f"rlt_embed_threshold={g('rlt_embed_threshold', 0.34)}",
-                f"rlt_embed_metric={g('rlt_embed_metric', 'l2')}",
+                # rlt_mask_space / rlt_embed_* moved to the shared block above --
+                # they apply to APT-Temporal too now, not just RLT.
             ]
         return ",".join(args)
 

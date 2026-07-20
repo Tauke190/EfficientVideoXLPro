@@ -518,6 +518,13 @@ class LlavaMetaForCausalLM(ABC):
         REDUNDANT carry chain as to an RLT drop run (see dirty_subtile_mask's
         docstring), so it shares RLT's knob and RLT's "ref" default rather
         than a second copy of the same fix.
+
+        config.rlt_mask_space / rlt_embed_threshold / rlt_embed_metric are
+        shared on the same grounds, and matter more here than they do for RLT
+        alone: the pixel dirty test's sensitivity scales with the local spatial
+        gradient, while APT merges cells on low intensity dispersion, so
+        spatial merging systematically hands the temporal check the tiles it is
+        least able to read. See dirty_subtile_mask_embed's docstring.
         """
         tapt = self.__dict__.get("_apt_temporal_module", None)
         if tapt is None:
@@ -531,6 +538,16 @@ class LlavaMetaForCausalLM(ABC):
                 attn_mode=getattr(self.config, "rlt_attn_mode", "reuse"),
                 mask_mode=getattr(self.config, "rlt_mask_mode", "ref"),
                 refresh_every=getattr(self.config, "rlt_refresh_every", 0),
+                mask_space=getattr(self.config, "rlt_mask_space", "pixel"),
+                embed_threshold=getattr(self.config, "rlt_embed_threshold", 0.34),
+                embed_metric=getattr(self.config, "rlt_embed_metric", "l2"),
+                # APT-Temporal-specific (no RLT counterpart: plain RLT has no
+                # partition to stabilize), so these get their own config names.
+                window=getattr(self.config, "apt_temporal_window", 1),
+                cut_threshold=getattr(self.config, "apt_temporal_cut_threshold", 0.8),
+                partition_mode=getattr(self.config, "apt_temporal_partition_mode", "entropy"),
+                run_tol=getattr(self.config, "apt_temporal_run_tol", 0),
+                persist=getattr(self.config, "apt_temporal_persist", False),
             )
             self.__dict__["_apt_temporal_module"] = tapt
         return tapt

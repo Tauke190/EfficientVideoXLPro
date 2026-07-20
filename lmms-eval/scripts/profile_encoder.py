@@ -192,8 +192,11 @@ def apply_variant(model, method, use_sae, args):
     cfg.rlt_attn_mode          = args.rlt_attn_mode
     cfg.rlt_mask_mode          = args.rlt_mask_mode
     cfg.rlt_refresh_every      = int(args.rlt_refresh_every)
-    # mask_space and its threshold are RLT-only -- APT-Temporal tests sub-tiles of raw
-    # pixels, so it ignores these and keeps reading rlt_threshold.
+    # mask_space and its threshold drive APT-Temporal's dirty-tile check too, not just
+    # RLT's drop test -- both ask the same question, so one knob covers both. It matters
+    # MORE under APT-Temporal: the pixel test's sensitivity scales with the local spatial
+    # gradient, and APT merges on low intensity dispersion, so spatial merging routes the
+    # temporal check into the regime where it can least detect change.
     cfg.rlt_mask_space         = args.rlt_mask_space
     cfg.rlt_embed_threshold    = float(args.rlt_embed_threshold)
     cfg.rlt_embed_metric       = args.rlt_embed_metric
@@ -205,6 +208,14 @@ def apply_variant(model, method, use_sae, args):
     cfg.apt_thresholds = thr
     cfg.apt_num_scales = args.apt_num_scales
     cfg.apt_input_res  = args.apt_input_res
+    # APT-Temporal partition knobs. Without these the profiler silently used the
+    # entropy partition regardless of what was being profiled, so survivor-mode
+    # latency (the number that decides whether the composition is dominated on
+    # speed as well as accuracy) could not be measured at all.
+    cfg.apt_temporal_partition_mode = args.apt_temporal_partition_mode
+    cfg.apt_temporal_run_tol        = int(args.apt_temporal_run_tol)
+    cfg.apt_temporal_persist        = bool(args.apt_temporal_persist)
+    cfg.apt_temporal_window         = int(args.apt_temporal_window)
 
 
 def reset_tallies(model):
@@ -390,9 +401,11 @@ def main():
     parser.add_argument("--rlt_attn_mode", choices=["reuse", "per_frame"], default="reuse",
                         help="'reuse' = survivors attend over the full frame; 'per_frame' = legacy starved attention")
     parser.add_argument("--rlt_mask_space", choices=["pixel", "embed"], default="pixel",
-                        help="Where the RLT drop test compares patches: 'pixel' (paper) or "
+                        help="Where the drop test compares patches: 'pixel' (paper) or "
                              "'embed' (patch embeddings; noise-robust). Uses "
-                             "--rlt_embed_threshold, NOT --rlt_threshold. RLT only.")
+                             "--rlt_embed_threshold, NOT --rlt_threshold. Applies to RLT and "
+                             "to APT-Temporal's dirty-tile check alike (it matters more for "
+                             "the latter -- see dirty_subtile_mask_embed's docstring).")
     parser.add_argument("--rlt_embed_threshold", type=float, default=0.34,
                         help="Drop threshold for --rlt_mask_space embed. Separate scale from "
                              "--rlt_threshold; calibrate against a target keep rate.")
@@ -406,6 +419,19 @@ def main():
                         help="Colon-separated per-scale thresholds, e.g. 4.0:6.0 (single value broadcasts)")
     parser.add_argument("--apt_num_scales", type=int, default=3)
     parser.add_argument("--apt_input_res",  type=int, default=392)
+    parser.add_argument("--apt_temporal_partition_mode", choices=["entropy", "survivor"],
+                        default="entropy",
+                        help="APT-Temporal partition source: 'entropy' (per-frame quadtree from "
+                             "spatial flatness) or 'survivor' (merge only what RLT could not drop, "
+                             "so spatial saving is additive on top of temporal reuse)")
+    parser.add_argument("--apt_temporal_run_tol", type=int, default=0,
+                        help="survivor mode: max spread of forward run length inside one merged cell")
+    parser.add_argument("--apt_temporal_persist", action="store_true",
+                        help="survivor mode: keep a coarse cell alive while its contents stay quiet, "
+                             "so a merged token is carried for its whole run instead of fragmenting "
+                             "(and paying a fresh re-encode) the moment motion stops")
+    parser.add_argument("--apt_temporal_window", type=int, default=1,
+                        help="entropy mode: frames sharing one partition (1 = per-frame)")
     parser.add_argument("--warmup",  type=int, default=1,
                         help="Warmup passes (first video, excluded from timings and tallies)")
     parser.add_argument("--runs",    type=int, default=1,

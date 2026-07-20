@@ -58,20 +58,24 @@ from xformers.ops.fmha.attn_bias import BlockDiagonalMask
 from timm.layers import resample_abs_pos_embed
 
 try:
+    from .apt_static_tokens import select_patches_by_threshold
     from .siglip_apt_embeddings import SiglipAPTEmbeddings
     from .apt_temporal_static_tokens import (
         REDUNDANT, FRESH,
-        dense_scale_code_grid, dirty_subtile_mask, shape_match_grid,
-        cell_all_quiet, classify_cells, classification_stats,
-        compute_origin_index,
+        dense_scale_code_grid, dirty_subtile_mask, dirty_subtile_mask_embed,
+        shape_match_grid, cell_all_quiet, classify_cells, classification_stats,
+        compute_origin_index, compute_run_lengths, detect_cuts, window_ids,
+        window_max_entropy, survivor_aligned_masks,
     )
 except ImportError:  # allow running this file directly as a script for testing
+    from apt_static_tokens import select_patches_by_threshold
     from siglip_apt_embeddings import SiglipAPTEmbeddings
     from apt_temporal_static_tokens import (
         REDUNDANT, FRESH,
-        dense_scale_code_grid, dirty_subtile_mask, shape_match_grid,
-        cell_all_quiet, classify_cells, classification_stats,
-        compute_origin_index,
+        dense_scale_code_grid, dirty_subtile_mask, dirty_subtile_mask_embed,
+        shape_match_grid, cell_all_quiet, classify_cells, classification_stats,
+        compute_origin_index, compute_run_lengths, detect_cuts, window_ids,
+        window_max_entropy, survivor_aligned_masks,
     )
 
 
@@ -115,6 +119,54 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
             config.rlt_refresh_every -- see dirty_subtile_mask's docstring for
             why "ref" (diff against the carried reference, not frame t-1) is
             the correct default for a REDUNDANT run of any length.
+        mask_space: WHERE the dirty check compares base tiles -- "pixel"
+            (default, the paper's test, uses `threshold`) or "embed" (uses
+            `embed_threshold`/`embed_metric`, comparing frozen patch-embed
+            outputs). Again the SAME knob RLT uses (config.rlt_mask_space),
+            for the same reason the threshold is shared: both are answering the
+            identical question. It carries more weight here than it does for
+            RLT alone -- the pixel test's sensitivity scales with the local
+            spatial gradient, and APT merges on low intensity dispersion, so
+            spatial merging systematically feeds the temporal check the tiles
+            it is least able to read. See dirty_subtile_mask_embed's docstring.
+        embed_threshold, embed_metric: shared with RLT
+            (config.rlt_embed_threshold / config.rlt_embed_metric); used only
+            when mask_space="embed". NOT interchangeable with `threshold`,
+            which is a pixel-scale value.
+        window: how many frames share ONE partition. 1 (default) = today's
+            behaviour, a fresh independent partition per frame, and the
+            windowing code is then exactly inert. >1 computes one partition per
+            window from the window's MAX entropy, which makes shape_match true
+            by construction inside a window and so converts `missed_reuse`
+            (cells that did not change but could not be carried because the
+            quadtree boundaries wobbled) into actual reuse. The cost is a
+            partition that is window-optimal rather than frame-optimal, i.e.
+            slightly more tokens per frame, growing with `window`. Windows also
+            break at detected cuts, so this is a MAXIMUM length, not a fixed
+            stride -- see window_ids.
+        cut_threshold: fraction of dirty base tiles above which a frame starts a
+            new window. Only consulted when window > 1. See detect_cuts for why
+            a boundary at a cut is free, and why this does not need to be a
+            semantically correct shot detector.
+        partition_mode: "entropy" (default, plain APT: per-frame quadtree from
+            spatial flatness) or "survivor" (RLT-first: merge only what RLT
+            could not drop, so spatial saving is additive on top of temporal
+            reuse rather than competing with it). See survivor_aligned_masks.
+        run_tol: survivor mode only -- max spread of forward run length allowed
+            inside one merged cell. 0 = exact agreement.
+        persist: survivor mode only -- keep a coarse cell alive while everything
+            inside it stays quiet, so a merged token is carried for its whole
+            run instead of fragmenting the moment its tiles stop changing.
+            Without it, merging a block that is about to go still costs MORE
+            than never merging it (the split forces a fresh re-encode of every
+            tile inside). Drives missed_reuse to ~0. It is a trade, not a free
+            win: the region then stays at merged resolution through the still
+            stretch rather than refreshing at full resolution. Default off so
+            the un-persisted result stays reproducible.
+
+    `self.last_windows` holds the number of windows the last clip was split
+    into (== T when window=1), so a profile run can report the realized cut rate
+    alongside the classification stats.
     (No run-length embedding argument: TAPT carries no learnable temporal state,
     matching plain RLT -- see the module docstring.)
 
@@ -131,6 +183,14 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
         attn_mode: str = "reuse",
         mask_mode: str = "ref",
         refresh_every: int = 0,
+        mask_space: str = "pixel",
+        embed_threshold: float = 0.34,
+        embed_metric: str = "l2",
+        window: int = 1,
+        cut_threshold: float = 0.8,
+        partition_mode: str = "entropy",
+        run_tol: int = 0,
+        persist: bool = False,
     ) -> None:
         super().__init__()
         self.apt = apt
@@ -140,7 +200,30 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
         assert mask_mode in ("ref", "consec"), f"unknown mask_mode {mask_mode!r}"
         self.mask_mode = mask_mode
         self.refresh_every = refresh_every
+        assert mask_space in ("pixel", "embed"), f"unknown mask_space {mask_space!r}"
+        self.mask_space = mask_space
+        self.embed_threshold = embed_threshold
+        assert embed_metric in ("l2", "cosine"), f"unknown embed_metric {embed_metric!r}"
+        self.embed_metric = embed_metric
+        assert window >= 1, f"window must be >= 1, got {window}"
+        self.window = window
+        self.cut_threshold = cut_threshold
+        assert partition_mode in ("entropy", "survivor"), \
+            f"unknown partition_mode {partition_mode!r}"
+        self.partition_mode = partition_mode
+        self.run_tol = run_tol
+        self.persist = persist
         self.last_stats: Dict[str, float] = {}
+        self.last_windows: int = 0
+
+    @property
+    def active_threshold(self) -> float:
+        """The threshold actually in force, given mask_space. For logging.
+
+        Mirrors SiglipRLTEmbeddings.active_threshold so llava_arch's TAPT log
+        line can report the same way the RLT one does.
+        """
+        return self.embed_threshold if self.mask_space == "embed" else self.threshold
 
     def _kv_rows_per_frame(self, origin_index: torch.Tensor, events_per_frame):
         """Per frame, the packed rows that make up its FULL partition.
@@ -246,17 +329,82 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
         C = apt.embed_dim
         dev = frames.device
 
-        input_dict = apt.tokenizer(frames)
-        masks = input_dict["masks"]
+        # ORDER: dirty -> cuts -> partition -> classification. The dirty check
+        # runs at base scale and never references the partition
+        # (dirty_subtile_mask{,_embed} both take base_patch_size), so it can be
+        # computed first -- which is what lets cut detection drive the window
+        # boundaries the partition is then built over. Nothing here is circular.
+        #
+        # Base tiles as (T,G,G,3,p,p). Needed here rather than just before the
+        # merge pass because mask_space="embed" runs the dirty check on their
+        # embeddings, which therefore have to exist BEFORE classification.
+        patches = frames.unfold(2, base_p, base_p).unfold(3, base_p, base_p)   # (T,3,G,G,p,p)
+        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()               # (T,G,G,3,p,p)
+
+        if self.mask_space == "embed":
+            # Embed EVERY base tile, not just the FRESH ones, because which
+            # tiles are FRESH is what this test is about to decide. That costs
+            # the frozen patch conv on the redundant tiles too -- ~0.7M MACs
+            # each against the ~410M MACs of transformer a token costs, i.e.
+            # well under 1% (the same arithmetic that retired the OVERRIDE
+            # class; see apt_temporal_static_tokens' HISTORY note). The
+            # decision is nearly free to make on the right quantity, so there
+            # is no reason to make it on a pixel proxy whose sensitivity APT
+            # has already biased -- see dirty_subtile_mask_embed's docstring.
+            #
+            # No position embedding is added yet, which is exactly what
+            # find_idxs_to_keep_embed requires; the merge pass adds it below.
+            raw_tile = apt._embed_patches(
+                patches.reshape(-1, 3, base_p, base_p)
+            ).view(T, G, G, C)                                                 # (T,G,G,C)
+            dirty = dirty_subtile_mask_embed(
+                raw_tile, self.embed_threshold, metric=self.embed_metric,
+                mask_mode=self.mask_mode, refresh_every=self.refresh_every,
+            )
+        else:
+            # Dirty check on the SAME (SigLIP-normalized) pixel scale RLT itself
+            # uses -- no un-normalize step -- so self.threshold is directly the
+            # shared config.rlt_threshold value, not a second differently-scaled
+            # knob (see dirty_subtile_mask's docstring).
+            raw_tile = None
+            dirty = dirty_subtile_mask(frames.float(), self.threshold, base_p,
+                                        mask_mode=self.mask_mode, refresh_every=self.refresh_every)
+
+        # ---- partition, over windows rather than per frame.
+        # window=1 (default) puts every frame in its own window, so
+        # window_max_entropy is a no-op max over one frame and this reduces to
+        # the per-frame partition EXACTLY -- windowing is inert until enabled.
+        #
+        # shape_match_grid is deliberately still called. Inside a window every
+        # frame carries the identical partition, so it is satisfied for free
+        # (that is the entire point); at a window boundary the partition changes
+        # and it correctly reports FRESH; and if two adjacent windows happen to
+        # agree, reuse crosses the boundary at no extra cost. Keeping it also
+        # keeps `missed_reuse` meaningful as the diagnostic that motivated this.
+        if self.partition_mode == "survivor":
+            # RLT-first: the partition is built from what RLT could NOT drop, so
+            # spatial merging is additive on top of temporal reuse instead of
+            # competing with it for the same redundancy. `window` does not apply
+            # -- there is no entropy map to pool, and survivorship is already a
+            # per-frame temporal quantity. See survivor_aligned_masks, including
+            # its KNOWN COST note about the motion-stops transition (watch
+            # missed_reuse).
+            masks = survivor_aligned_masks(
+                dirty, compute_run_lengths(dirty), apt.patch_sizes, base_p,
+                run_tol=self.run_tol, persist=self.persist,
+            )
+            self.last_windows = T
+        else:
+            importance = apt.tokenizer.compute_importance_maps(frames)
+            if self.window > 1:
+                seg_id = window_ids(detect_cuts(dirty, self.cut_threshold), self.window)
+                importance = window_max_entropy(importance, seg_id)
+                self.last_windows = int(seg_id.max().item()) + 1
+            else:
+                self.last_windows = T
+            masks = select_patches_by_threshold(importance, thresholds=apt.tokenizer.thresholds)
 
         scale_grid = dense_scale_code_grid(masks, apt.patch_sizes, base_p)
-
-        # Dirty check on the SAME (SigLIP-normalized) pixel scale RLT itself
-        # uses -- no un-normalize step -- so self.threshold is directly the
-        # shared config.rlt_threshold value, not a second differently-scaled
-        # knob (see dirty_subtile_mask's docstring).
-        dirty = dirty_subtile_mask(frames.float(), self.threshold, base_p,
-                                    mask_mode=self.mask_mode, refresh_every=self.refresh_every)
 
         shape_match = shape_match_grid(scale_grid, masks, apt.patch_sizes, base_p)
         # Aggregated over frame t's OWN cell footprint (masks[ps][t]), not
@@ -275,11 +423,14 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
         # FRESH cell is itself FRESH -- which means the non-FRESH slots left at zero
         # below are never read by the merge pass. (A violation of that invariant
         # would surface as the `origin_index >= 0` assert further down.)
-        patches = frames.unfold(2, base_p, base_p).unfold(3, base_p, base_p)   # (T,3,G,G,p,p)
-        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()               # (T,G,G,3,p,p)
-        fresh_vals = apt._embed_patches(
-            patches[is_new_token].reshape(-1, 3, base_p, base_p)
-        )                                                                      # (Nfresh, C)
+        if raw_tile is not None:
+            # mask_space="embed" already ran the frozen conv over every tile;
+            # select rather than embed a second time.
+            fresh_vals = raw_tile[is_new_token]                                # (Nfresh, C)
+        else:
+            fresh_vals = apt._embed_patches(
+                patches[is_new_token].reshape(-1, 3, base_p, base_p)
+            )                                                                  # (Nfresh, C)
         pos_grid = apt.base_pos_embed.to(frames.dtype).view(G, G, C)
         fresh_vals = fresh_vals + pos_grid.unsqueeze(0).expand(T, G, G, C)[is_new_token]
 
