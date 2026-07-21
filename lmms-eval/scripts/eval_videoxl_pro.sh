@@ -82,31 +82,31 @@ LOG_FILE="$LOG_DIR/eval_apttemporal_$(date +%Y%m%d_%H%M%S).log"
 
 
 # APT + RLT only in embedding space
-args=(
-    "pretrained=MINT-SJTU/Video-XL-Pro-3B"
-    "use_apt_temporal=True"
-    "apt_temporal_partition_mode=survivor"
-    "apt_temporal_run_tol=0"
-    "rlt_mask_space=embed"
-    "rlt_embed_threshold=0.34"
-    "rlt_attn_mode=reuse"
-    "max_frames_num=128"
-  )
+# args=(
+#     "pretrained=MINT-SJTU/Video-XL-Pro-3B"
+#     "use_apt_temporal=True"
+#     "apt_temporal_partition_mode=survivor"
+#     "apt_temporal_run_tol=0"
+#     "rlt_mask_space=embed"
+#     "rlt_embed_threshold=0.34"
+#     "rlt_attn_mode=reuse"
+#     "max_frames_num=128"
+#   )
   
 
-# RLT + APT1 only in embedding space
-# args=(
-#   "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-temporal-apt-llava-ego4D"
-#   "max_frames_num=128"
-#   "use_apt_temporal=True"
-#   "rlt_mask_space=embed"
-#   "apt_threshold=4.0:6.0"
-#   "rlt_embed_threshold=0.34"
-#   "apt_temporal_window=1"
-#   "rlt_embed_metric=l2"
-#   "rlt_attn_mode=reuse"
-#   "attn_implementation=flash_attention_2"
-#   )
+# RLT + APT only in embedding space
+args=(
+  "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-rlt-apt-survivor-embed-llava-ego4D"
+  "max_frames_num=128"
+  "use_apt_temporal=True"
+  "rlt_mask_space=embed"
+  "apt_threshold=4.0:6.0"
+  "rlt_embed_threshold=0.34"
+  "apt_temporal_window=1"
+  "rlt_embed_metric=l2"
+  "rlt_attn_mode=reuse"
+  "attn_implementation=flash_attention_2"
+  )
 MODEL_ARGS=$(IFS=,; echo "${args[*]}")
 
 # datasets = [mlvu_test , egoschema_subset]
