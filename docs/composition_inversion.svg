@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 520" width="920" height="520"
+     font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+
+  <defs>
+    <style>
+      .ttl   { font-size:15px; font-weight:650; fill:#14181E; }
+      .sub   { font-size:11.5px; fill:#6E7885; }
+      .qlab  { font-size:12px; font-weight:600; fill:#14181E; }
+      .qell  { font-size:11px; fill:#6E7885; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+      .badge { font-size:12.5px; font-weight:700; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+      .tally { font-size:12.5px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+      .eyeb  { font-size:10.5px; font-weight:600; fill:#B4791C; letter-spacing:1.4px; }
+      .key   { font-size:11px; fill:#6E7885; }
+    </style>
+  </defs>
+
+  <rect width="920" height="520" fill="#FFFFFF"/>
+  <rect x="0.5" y="0.5" width="919" height="519" fill="none" stroke="#DCE0E6"/>
+
+  <text class="eyeb" x="40" y="34">THE INVERSION</text>
+  <text class="ttl"  x="40" y="58" font-size="17">A merge saves (s²−1)/ℓ tokens per frame — so payoff is set by ℓ, not by flatness</text>
+
+  <!-- ================= PANEL A : entropy ================= -->
+  <text class="ttl" x="40" y="96">Entropy partition — merges what is flat</text>
+  <text class="sub" x="40" y="113">Selects the top row. Both merges land where ℓ is large or content is cheap.</text>
+
+  <g transform="translate(40,128)">
+    <!-- quadrant tints -->
+    <rect x="0"   y="0"   width="144" height="144" fill="#F7EBD2"/>
+    <rect x="144" y="0"   width="144" height="144" fill="#F7EBD2"/>
+    <rect x="0"   y="144" width="144" height="144" fill="#F5F6F8"/>
+    <rect x="144" y="144" width="144" height="144" fill="#F5F6F8"/>
+
+    <!-- fine 8x8 grid -->
+    <g stroke="#DCE0E6" stroke-width="1">
+      <path d="M36 0V288M72 0V288M108 0V288M180 0V288M216 0V288M252 0V288"/>
+      <path d="M0 36H288M0 72H288M0 108H288M0 180H288M0 216H288M0 252H288"/>
+    </g>
+
+    <!-- merged cells: heavy boundary, fine grid suppressed by overlay -->
+    <rect x="2"   y="2"   width="140" height="140" fill="#F7EBD2" stroke="#B4791C" stroke-width="2.5"/>
+    <rect x="146" y="2"   width="140" height="140" fill="#F7EBD2" stroke="#B4791C" stroke-width="2.5"/>
+
+    <!-- quadrant separators -->
+    <path d="M144 0V288M0 144H288" stroke="#AAB2BD" stroke-width="1.5"/>
+    <rect x="0" y="0" width="288" height="288" fill="none" stroke="#14181E" stroke-width="1.5"/>
+
+    <!-- labels -->
+    <text class="qlab" x="12" y="22">wall</text>
+    <text class="qell" x="12" y="37">flat · still · ℓ=10</text>
+    <text class="badge" x="12" y="132" fill="#B4791C">1 token</text>
+
+    <text class="qlab" x="156" y="22">shirt</text>
+    <text class="qell" x="156" y="37">flat · moving · ℓ=1</text>
+    <text class="badge" x="156" y="132" fill="#B4791C">1 token</text>
+
+    <text class="qlab" x="12" y="166">bookshelf</text>
+    <text class="qell" x="12" y="181">textured · still · ℓ=10</text>
+    <text class="badge" x="12" y="276" fill="#6E7885">16 tokens</text>
+
+    <text class="qlab" x="156" y="166">plant in wind</text>
+    <text class="qell" x="156" y="181">textured · moving · ℓ=1</text>
+    <text class="badge" x="156" y="276" fill="#A33A2E">16 tokens</text>
+  </g>
+
+  <text class="tally" x="40" y="450" fill="#6E7885">saves  15/10 + 15/1  =</text>
+  <text class="tally" x="196" y="450" fill="#14181E" font-size="15" font-weight="700">16.5 tok/frame</text>
+  <text class="key" x="40" y="470" fill="#A33A2E">✗ declines the plant — the single most expensive region in the shot</text>
+
+  <!-- ================= PANEL B : survivor ================= -->
+  <text class="ttl" x="500" y="96">Survivor partition — merges what changed</text>
+  <text class="sub" x="500" y="113">Selects the right column. Both merges land where ℓ = 1, the maximum payoff.</text>
+
+  <g transform="translate(500,128)">
+    <rect x="0"   y="0"   width="144" height="144" fill="#F5F6F8"/>
+    <rect x="144" y="0"   width="144" height="144" fill="#E3EFEC"/>
+    <rect x="0"   y="144" width="144" height="144" fill="#F5F6F8"/>
+    <rect x="144" y="144" width="144" height="144" fill="#E3EFEC"/>
+
+    <g stroke="#DCE0E6" stroke-width="1">
+      <path d="M36 0V288M72 0V288M108 0V288M180 0V288M216 0V288M252 0V288"/>
+      <path d="M0 36H288M0 72H288M0 108H288M0 180H288M0 216H288M0 252H288"/>
+    </g>
+
+    <rect x="146" y="2"   width="140" height="140" fill="#E3EFEC" stroke="#2C6E63" stroke-width="2.5"/>
+    <rect x="146" y="146" width="140" height="140" fill="#E3EFEC" stroke="#2C6E63" stroke-width="2.5"/>
+
+    <path d="M144 0V288M0 144H288" stroke="#AAB2BD" stroke-width="1.5"/>
+    <rect x="0" y="0" width="288" height="288" fill="none" stroke="#14181E" stroke-width="1.5"/>
+
+    <text class="qlab" x="12" y="22">wall</text>
+    <text class="qell" x="12" y="37">carried by reuse</text>
+    <text class="badge" x="12" y="132" fill="#6E7885">0 tokens</text>
+
+    <text class="qlab" x="156" y="22">shirt</text>
+    <text class="qell" x="156" y="37">all tiles changed</text>
+    <text class="badge" x="156" y="132" fill="#2C6E63">1 token</text>
+
+    <text class="qlab" x="12" y="166">bookshelf</text>
+    <text class="qell" x="12" y="181">carried by reuse</text>
+    <text class="badge" x="12" y="276" fill="#6E7885">0 tokens</text>
+
+    <text class="qlab" x="156" y="166">plant in wind</text>
+    <text class="qell" x="156" y="181">all tiles changed</text>
+    <text class="badge" x="156" y="276" fill="#2C6E63">1 token</text>
+  </g>
+
+  <text class="tally" x="500" y="450" fill="#6E7885">saves  15/1 + 15/1  =</text>
+  <text class="tally" x="648" y="450" fill="#14181E" font-size="15" font-weight="700">30 tok/frame</text>
+  <text class="key" x="500" y="470" fill="#2C6E63">✓ merges exactly the regions temporal reuse cannot help with</text>
+
+  <!-- ================= key ================= -->
+  <g transform="translate(40,494)">
+    <rect x="0" y="-9" width="12" height="12" fill="#F7EBD2" stroke="#B4791C" stroke-width="1.5"/>
+    <text class="key" x="19" y="1">merged by entropy (flatness)</text>
+    <rect x="196" y="-9" width="12" height="12" fill="#E3EFEC" stroke="#2C6E63" stroke-width="1.5"/>
+    <text class="key" x="215" y="1">merged by survivorship (change)</text>
+    <rect x="424" y="-9" width="12" height="12" fill="#F5F6F8" stroke="#DCE0E6" stroke-width="1.5"/>
+    <text class="key" x="443" y="1">left at base scale</text>
+    <text class="key" x="574" y="1" fill="#6E7885">ℓ = frames a token stands in for before it refreshes · 16 base tiles per quadrant</text>
+  </g>
+</svg>

@@ -113,7 +113,19 @@ MID_RUN_NAME="videoxlpro-3b-rlt-apt-survivor-embed-llava-ego4D"
 
 echo "Fine-tuning run: ${MID_RUN_NAME}  (partition=survivor, mask_space=embed, persist=False)"
 
-ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NNODES}" --node_rank="${RANK}" --master_addr="${ADDR}" --master_port="${PORT}" \
+# ACCELERATE_CPU_AFFINITY deliberately NOT set. With it on, accelerate reads the
+# GPU's NUMA node, derives its own "nearby cores" list, and hard-sets it with
+# os.sched_setaffinity() -- without checking what the SLURM cgroup actually permits.
+# On a node where those two disagree (seen on c5-2) the syscall rejects it with
+# OSError [Errno 22] Invalid argument and BOTH ranks die. It fails inside
+# TrainingArguments.__post_init__, i.e. before any training flag is parsed, so the
+# traceback points at hf_argparser and reads like a config error when it is really a
+# scheduling one. Node-dependent, so the same script runs fine elsewhere.
+#
+# Nothing is lost: #SBATCH --gres-flags=enforce-binding + --cpus-per-gpu already bind
+# each rank to CPUs on its GPU's NUMA node, cgroup-aware. Accelerate's pass is a
+# second, less-informed attempt at a job SLURM has already done correctly.
+torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NNODES}" --node_rank="${RANK}" --master_addr="${ADDR}" --master_port="${PORT}" \
     videoxlpro/train/train_mem.py \
     --deepspeed scripts/zero3.json \
     --model_name_or_path ${MODEL_PATH} \
@@ -166,7 +178,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --mlvu_eval_frames 128 \
     --mlvu_eval_limit 100 \
     --mlvu_eval_timeout 10800 \
-    --learning_rate 1e-5 \
+    --learning_rate 1e-4 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \

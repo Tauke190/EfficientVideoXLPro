@@ -46,21 +46,54 @@ export PYTHONPATH=/home/av354855/EfficientVideoXLPro:$PYTHONPATH
 export HF_HOME=/home/av354855/.cache/huggingface
 
 
-# ---- Ablation variants (uncomment one --model_args below; keep the rest commented) ----
-# --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True,use_rlt=True,rlt_threshold=0.2 \
-# --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_apt=True,apt_threshold=4.0:6.0,apt_num_scales=3 \
-# --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=False,use_rlt=True,rlt_threshold=0.3 \
-# --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=True \
+
+ # APT
+# args=(
+#   "pretrained=MINT-SJTU/Video-XL-Pro-3B"
+#   "max_frames_num=128"
+#   "use_apt=True"clear
+#   "apt_num_scales=3"
+#   "apt_threshold=4.0:6.0"
+#   "attn_implementation=flash_attention_2"
+#)
+
+ RLT in embedding space
+  args=(
+    "pretrained=MINT-SJTU/Video-XL-Pro-3B"
+    "max_frames_num=128"
+    "use_rlt=True"
+    "rlt_mask_space=embed"
+    "rlt_embed_threshold=0.34"
+    "rlt_embed_metric=l2"
+    "rlt_attn_mode=reuse"
+    "attn_implementation=flash_attention_2"
+  )
+
+# APT + RLT
+  # args=(
+  #   "pretrained=MINT-SJTU/Video-XL-Pro-3B"
+  #   "max_frames_num=128"
+  #   "use_apt_temporal=True"
+  #   "rlt_mask_space=embed"
+  #   "rlt_mask_mode=ref"
+  #   "rlt_attn_mode=reuse"
+  #   "rlt_embed_threshold=0.34"
+  #   "apt_threshold=4.0:6.0"
+  # )
+
 
 LOG_DIR="./logs/videoxlpro_mlvu"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/eval_$(date +%Y%m%d_%H%M%S).log"
 
-accelerate launch --num_processes=2 --main_process_port "$PORT" \
+MODEL_ARGS=$(IFS=,; echo "${args[*]}")
+
+
+accelerate launch --num_processes=3 --main_process_port 12345 \
     -m lmms_eval \
     --model videoxlpro \
     --tasks mlvu_test \
-    --model_args pretrained=MINT-SJTU/Video-XL-Pro-3B,max_frames_num=128,attn_implementation=flash_attention_2,use_sae=False \
+    --model_args "$MODEL_ARGS" \
     --batch_size 1 \
     --log_samples \
     --log_samples_suffix videoxlpro_mlvu \

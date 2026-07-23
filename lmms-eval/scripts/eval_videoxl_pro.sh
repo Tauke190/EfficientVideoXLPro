@@ -23,12 +23,14 @@ LOG_FILE="$LOG_DIR/eval_apttemporal_$(date +%Y%m%d_%H%M%S).log"
 
 #[ use_apt , use_rlt , use_apt_temporal]
 
+# Original
 # args=(
 #   "pretrained=MINT-SJTU/Video-XL-Pro-3B"
 #   "max_frames_num=128"
 #   "attn_implementation=flash_attention_2"
 #   )
 
+# APT
 # args=(
 #   "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-apt-llava-ego4D/checkpoint-10000"
 #   # "pretrained=MINT-SJTU/Video-XL-Pro-3B"
@@ -38,18 +40,6 @@ LOG_FILE="$LOG_DIR/eval_apttemporal_$(date +%Y%m%d_%H%M%S).log"
 #   "apt_threshold=4.0:6.0"
 #   "attn_implementation=flash_attention_2"
 #   )
-
-  # RLT in pixel space
-  # args=(
-  # "pretrained=MINT-SJTU/Video-XL-Pro-3B"
-  # "max_frames_num=128"
-  # "use_rlt=True"
-  # "rlt_threshold=0.2"
-  # "rlt_temporal_pos_scale=0.0"
-  # "rlt_attn_mode=reuse"
-  # "attn_implementation=flash_attention_2"
-  # )
-
 
 
   # Naive APT + RLT Composition
@@ -67,21 +57,20 @@ LOG_FILE="$LOG_DIR/eval_apttemporal_$(date +%Y%m%d_%H%M%S).log"
 
 
 
-
   # RLT in embedding space
-  # args=(
-  #   "pretrained=MINT-SJTU/Video-XL-Pro-3B"
-  #   "max_frames_num=128"
-  #   "use_rlt=True"
-  #   "rlt_mask_space=embed"
-  #   "rlt_embed_threshold=0.34"
-  #   "rlt_embed_metric=l2"
-  #   "rlt_attn_mode=reuse"
-  #   "attn_implementation=flash_attention_2"
-  # )
+  args=(
+    "pretrained=MINT-SJTU/Video-XL-Pro-3B"
+    "max_frames_num=256"
+    "use_rlt=True"
+    "rlt_mask_space=embed"
+    "rlt_embed_threshold=0.34"
+    "rlt_embed_metric=l2"
+    "rlt_attn_mode=reuse"
+    "attn_implementation=flash_attention_2"
+  )
 
 
-# APT + RLT only in embedding space
+# # APT + RLT only in embedding space
 # args=(
 #     "pretrained=MINT-SJTU/Video-XL-Pro-3B"
 #     "use_apt_temporal=True"
@@ -90,23 +79,22 @@ LOG_FILE="$LOG_DIR/eval_apttemporal_$(date +%Y%m%d_%H%M%S).log"
 #     "rlt_mask_space=embed"
 #     "rlt_embed_threshold=0.34"
 #     "rlt_attn_mode=reuse"
-#     "max_frames_num=128"
+#     "max_frames_num=1024"
 #   )
   
 
 # RLT + APT only in embedding space
-args=(
-  "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-rlt-apt-survivor-embed-llava-ego4D"
-  "max_frames_num=128"
-  "use_apt_temporal=True"
-  "rlt_mask_space=embed"
-  "apt_threshold=4.0:6.0"
-  "rlt_embed_threshold=0.34"
-  "apt_temporal_window=1"
-  "rlt_embed_metric=l2"
-  "rlt_attn_mode=reuse"
-  "attn_implementation=flash_attention_2"
-  )
+# args=(
+#   "pretrained=/home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-rlt-apt-survivor-embed-llava-ego4D"
+#   "max_frames_num=1024"
+#   "use_apt_temporal=True"
+#   "rlt_mask_space=embed"
+#   "apt_threshold=4.0:6.0"
+#   "rlt_embed_threshold=0.34"
+#   "rlt_embed_metric=l2"
+#   "rlt_attn_mode=reuse"
+#   "attn_implementation=flash_attention_2"
+#   )
 MODEL_ARGS=$(IFS=,; echo "${args[*]}")
 
 # datasets = [mlvu_test , egoschema_subset]

@@ -1,2 +1,2 @@
 git diff
-scp -r 'av354855@crcv.eecs.ucf.edu:/home/av354855/EfficientVideoXLPro/videoxlpro/outputs/checkpoints/videoxlpro-3b-apt-temporal-llava-ego4D/checkpoint-13776' /home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-apt-llava-ego4D
+scp -r 'av354855@crcv.eecs.ucf.edu:/home/av354855/EfficientVideoXLPro/videoxlpro/outputs/checkpoints/videoxlpro-3b-rlt-apt-survivor-embed-llava-ego4D/checkpoint-12000' /home/av354855/projects/Video-XL-Pro/videoxlpro/outputs/checkpoints/videoxlpro-3b-rlt-apt-survivor-embed-llava-ego4D

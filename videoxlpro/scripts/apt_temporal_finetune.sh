@@ -96,3 +96,4 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --report_to wandb \
     --dataloader_drop_last True \
     --attn_implementation flash_attention_2
+    

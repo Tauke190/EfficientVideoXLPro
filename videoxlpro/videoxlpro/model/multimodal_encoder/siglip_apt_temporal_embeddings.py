@@ -432,10 +432,31 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
                 patches[is_new_token].reshape(-1, 3, base_p, base_p)
             )                                                                  # (Nfresh, C)
         pos_grid = apt.base_pos_embed.to(frames.dtype).view(G, G, C)
-        fresh_vals = fresh_vals + pos_grid.unsqueeze(0).expand(T, G, G, C)[is_new_token]
+        pos_for_tiles = pos_grid.unsqueeze(0).expand(T, G, G, C)[is_new_token]
 
+        # TWO grids, because a base-scale token and the merge want different
+        # things and conflating them leaks position into the merge.
+        #
+        # tile_content is E(patch) with NO position -- this is what patch_attn
+        # merges. Plain APT feeds its Conv2d^i raw E(patch) and adds position
+        # ONCE, at the coarse scale, after zero_conv (siglip_apt_embeddings._embed).
+        # Feeding position-embedded children instead would (a) force patch_attn to
+        # spend its capacity cancelling a systematic, content-independent signal
+        # before it can encode any sub-patch detail, and (b) double-count position:
+        # once implicitly at BASE granularity, entangled through the conv, and once
+        # explicitly at COARSE granularity via pos_for_events below.
+        #
+        # The zero-init gate hides this from the self-test: at zero_conv=0 `merged`
+        # is identically zero, so the merge's INPUT cannot affect the output and the
+        # TAPT-vs-plain-APT parity assertions in __main__ pass either way. The
+        # divergence appears only once training opens the gate -- invisible at step
+        # 0, growing with zero_conv from step 1 on. Test 5 below pins it.
+        tile_content = torch.zeros(T, G, G, C, device=dev, dtype=fresh_vals.dtype)
+        tile_content[is_new_token] = fresh_vals
+
+        # tile_embed is E(patch)+pos -- what a base-scale (s==1) cell emits directly.
         tile_embed = torch.zeros(T, G, G, C, device=dev, dtype=fresh_vals.dtype)
-        tile_embed[is_new_token] = fresh_vals
+        tile_embed[is_new_token] = fresh_vals + pos_for_tiles
 
         # ---- merge pass, grouped by scale (scale-major order first; frame
         # index recorded per event so the packed sequence can be reordered to
@@ -467,7 +488,8 @@ class SiglipAPTTemporalEmbeddings(nn.Module):
                                else tile_embed.new_zeros(1, C))
             else:
                 if n_events > 0:
-                    children = tile_embed.view(T, G // s, s, G // s, s, C)
+                    # tile_content, NOT tile_embed: the merge sees content only.
+                    children = tile_content.view(T, G // s, s, G // s, s, C)
                     children = children.permute(0, 1, 3, 2, 4, 5)           # (T,Gs,Gs,s,s,C)
                     children = children[event_mask]                         # (n_events,s,s,C)
                     attn_in = children.permute(0, 3, 1, 2).contiguous()     # (n_events,C,s,s)
@@ -721,6 +743,53 @@ if __name__ == "__main__":
     assert float(apt.zero_conv.bias.abs().sum()) == 0.0, "zero_conv must be zero-init"
     print("OK: zero-init at the seam -> every TAPT token reduces to plain APT's "
           "E(Resize_p)+pos at step 0 (asserted value-for-value by tests 1-3).")
+
+    # --- Test 5 (parity with the gate OPEN). Tests 1-4 all run at zero_conv == 0,
+    #     where `merged` is identically zero and the merge's INPUT therefore cannot
+    #     affect the output -- so they pass no matter what patch_attn is fed. That
+    #     blind spot hid a real bug: tile_embed carried the BASE position embedding
+    #     into patch_attn, while plain APT feeds it raw E(patch) and adds position
+    #     once at the coarse scale. patch_attn was being asked to cancel a
+    #     content-independent signal before it could encode anything, and position
+    #     was double-counted at two granularities. Invisible at step 0, growing with
+    #     zero_conv from step 1 on -- i.e. across the whole of training.
+    #
+    #     Two conditions must hold at once or this check is vacuous:
+    #       (a) zero_conv != 0, else the merge output is gated away;
+    #       (b) frames that actually MERGE. Test 2's torch.rand frames are
+    #           high-entropy, so every cell stays at base scale and the coarse path
+    #           is never entered at all -- which is why (a) alone would not catch it.
+    #     (b) is asserted explicitly below rather than assumed.
+    torch.manual_seed(3)
+    h0 = torch.rand(1, 3, img, img, device=dev, dtype=dtype) * 0.02 + 0.30   # low entropy -> merges
+    h1 = torch.rand(1, 3, img, img, device=dev, dtype=dtype) * 0.02 + 0.70   # differs -> both FRESH
+    clip5 = (torch.cat([h0, h1], dim=0) - 0.5) / 0.5
+
+    masks5 = apt.tokenizer(clip5[0:1])["masks"]
+    n_coarse = sum(int(masks5[ps].sum().item()) for ps in apt.patch_sizes[1:])
+    assert n_coarse > 0, (
+        f"test 5 is vacuous: no coarse cells to merge (scale counts "
+        f"{ {ps: int(masks5[ps].sum().item()) for ps in apt.patch_sizes} }). "
+        "Pick lower-entropy frames."
+    )
+
+    with torch.no_grad():                      # a plausible trained gate magnitude
+        torch.manual_seed(7)
+        apt.zero_conv.weight.normal_(0, 0.02)
+        apt.zero_conv.bias.normal_(0, 0.02)
+
+    dense5 = apt_temporal_scatter_back(*tapt(clip5))
+    for t in range(2):
+        s5, m5, ms5, _, _ = apt(clip5[t:t + 1])
+        ref5 = apt_scatter_back(s5, m5, ms5, base_p, img)
+        assert torch.allclose(dense5[t].float(), ref5[0].float(), atol=1e-2), (
+            f"gate-open parity: frame {t} diverges from plain per-frame APT by "
+            f"{(dense5[t].float() - ref5[0].float()).abs().max().item():.3e}. "
+            "TAPT and APT are feeding patch_attn different inputs -- check that the "
+            "merge consumes tile_content (no position), not tile_embed."
+        )
+    print(f"OK: gate-open parity ({n_coarse} coarse cells, zero_conv != 0) -> the "
+          "merge consumes content only, matching plain APT value-for-value.")
 
     print("\nOK: SigLIP-APT-Temporal embeddings run end-to-end "
           "(classification -> embed/merge -> xformers attn -> scatter-back).")
